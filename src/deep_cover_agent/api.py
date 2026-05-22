@@ -32,7 +32,7 @@ def build_runtime(settings: Settings) -> AgentRuntime:
         timeout_seconds=settings.request_timeout_seconds,
     )
     if settings.enable_langchain and settings.deepseek_api_key is not None:
-        decision_engine = LangChainDeepSeekDecisionEngine(settings)
+        decision_engine = LangChainDeepSeekDecisionEngine(settings, java_client)
     else:
         decision_engine = RuleBasedDecisionEngine()
     return AgentRuntime(java_client, decision_engine, settings)

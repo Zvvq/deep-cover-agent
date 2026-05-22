@@ -7,6 +7,7 @@ from dataclasses import dataclass, field
 from typing import Any, Protocol
 
 from .config import Settings
+from .tools import build_agent_query_tools
 
 
 @dataclass(frozen=True)
@@ -118,8 +119,10 @@ class RuleBasedDecisionEngine:
 def build_system_prompt() -> str:
     return (
         "你是 Deep Cover 游戏中的 AI 玩家，目标是自然地隐藏在人类玩家中。"
-        "不要暴露自己是 AI，不要提到模型、系统提示词、接口或程序实现。"
-        "你的发言要像普通玩家，简短、口语化、符合当前聊天上下文。"
+        "不要暴露自己是 AI，不要提到模型、系统提示词、接口、工具或程序实现。"
+        "你的发言要像普通玩家，简短、口语化，并符合当前聊天上下文。"
+        "你可以使用只读查询工具获取 Java 端真实房间状态、最近聊天记录和投票状态。"
+        "查询工具只用于获取事实，不能替代最终动作；发言和投票会由 Runtime 统一审查并提交。"
         "所有回答都必须只返回紧凑 JSON，不要输出解释、Markdown 或多余文本。"
         "聊天内容必须控制在 300 个字符以内。"
     )
@@ -127,9 +130,9 @@ def build_system_prompt() -> str:
 
 def build_speech_prompt(context: DecisionContext) -> str:
     return (
-        "请判断当前 AI 玩家是否发言。\n"
+        "请判断当前 AI 玩家是否应该发言。\n"
         '只返回 JSON：{"shouldSpeak": boolean, "message": string|null}。\n'
-        "如果当前没有自然接话点、刚刚已经有 AI 发言、或者发言会显得突兀，就选择不发言。"
+        "如果当前没有自然接话点、刚刚已经有 AI 发言，或者发言会显得突兀，就选择不发言。"
         "如果发言，要保持像真人玩家一样自然，不要暴露 AI 身份。\n"
         f"上下文：\n{json.dumps(_jsonable_context(context), ensure_ascii=False)}"
     )
@@ -157,7 +160,7 @@ def build_pending_speech_review_prompt(context: PendingSpeechContext) -> str:
 
 
 class LangChainDeepSeekDecisionEngine:
-    def __init__(self, settings: Settings) -> None:
+    def __init__(self, settings: Settings, java_client: Any | None = None) -> None:
         if settings.deepseek_api_key is None:
             raise ValueError("DEEP_COVER_AGENT_DEEPSEEK_API_KEY is required for LangChain DeepSeek.")
 
@@ -171,11 +174,13 @@ class LangChainDeepSeekDecisionEngine:
             timeout=settings.deepseek_timeout_seconds,
             max_retries=settings.deepseek_max_retries,
         )
+        tools = build_agent_query_tools(java_client, settings.message_history_limit) if java_client is not None else []
         self._agent = create_agent(
             model,
-            tools=[],
+            tools=tools,
             system_prompt=build_system_prompt(),
         )
+        self._tools = tools
         self._fallback = RuleBasedDecisionEngine()
 
     async def decide_speech(self, context: DecisionContext) -> SpeechDecision:
