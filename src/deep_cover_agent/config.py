@@ -26,9 +26,9 @@ class Settings(BaseSettings):
     idle_speech_after_seconds: float = 30.0
     message_history_limit: int = 50
 
-    speech_base_delay_seconds: float = 2.0
-    speech_typing_seconds_per_char: float = 1.0
-    speech_max_delay_seconds: float = 45.0
+    speech_base_delay_seconds: float = 1.5
+    speech_typing_seconds_per_char: float = 0.5
+    speech_max_delay_seconds: float = 30.0
     speech_retry_delay_seconds: float = 3.0
     pending_speech_max_reviews: int = 2
 
