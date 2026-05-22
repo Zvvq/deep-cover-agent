@@ -1,0 +1,11 @@
+.deps/
+.conda/
+.env
+.idea/
+.venv/
+.venv*/
+.pytest_cache/
+__pycache__/
+*.py[cod]
+*.egg-info/
+pytest-cache-files-*/
