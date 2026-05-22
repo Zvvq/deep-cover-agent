@@ -19,9 +19,27 @@ class DecisionContext:
 
 
 @dataclass(frozen=True)
+class PendingSpeechContext:
+    room_code: str
+    ai_player_id: str
+    room_state: dict[str, Any]
+    messages: list[dict[str, Any]]
+    original_message: str
+    new_messages: list[dict[str, Any]] = field(default_factory=list)
+
+
+@dataclass(frozen=True)
 class SpeechDecision:
     should_speak: bool
     message: str | None = None
+
+
+@dataclass(frozen=True)
+class PendingSpeechDecision:
+    action: str
+    message: str | None = None
+    reason: str = ""
+    extra_delay_seconds: float = 0.0
 
 
 @dataclass(frozen=True)
@@ -32,6 +50,9 @@ class VoteDecision:
 
 class DecisionEngine(Protocol):
     async def decide_speech(self, context: DecisionContext) -> SpeechDecision:
+        ...
+
+    async def review_pending_speech(self, context: PendingSpeechContext) -> PendingSpeechDecision:
         ...
 
     async def decide_vote(self, context: DecisionContext) -> VoteDecision:
@@ -84,6 +105,9 @@ class RuleBasedDecisionEngine:
     async def decide_speech(self, context: DecisionContext) -> SpeechDecision:
         return SpeechDecision(should_speak=False)
 
+    async def review_pending_speech(self, context: PendingSpeechContext) -> PendingSpeechDecision:
+        return PendingSpeechDecision(action="send_original", message=context.original_message)
+
     async def decide_vote(self, context: DecisionContext) -> VoteDecision:
         for player_id in context.candidate_player_ids:
             if player_id != context.ai_player_id:
@@ -121,6 +145,17 @@ def build_vote_prompt(context: DecisionContext) -> str:
     )
 
 
+def build_pending_speech_review_prompt(context: PendingSpeechContext) -> str:
+    return (
+        "你之前已经为当前 AI 玩家写好了一条待发送发言，但在模拟打字等待期间，聊天上下文发生了变化。\n"
+        "请判断这条旧发言是否还适合发送。\n"
+        '只返回 JSON：{"action":"send_original|send_revised|discard|wait","message":string|null,"reason":string,"extraDelaySeconds":number}。\n'
+        "send_original 表示发送原草稿；send_revised 表示发送修改后的 message；discard 表示丢弃不发；wait 表示再等一小会儿。\n"
+        "如果修改发言，message 必须像真人玩家一样自然、简短、口语化，不要暴露 AI 身份，且不超过 300 个字符。\n"
+        f"上下文：\n{json.dumps(_jsonable_pending_speech_context(context), ensure_ascii=False)}"
+    )
+
+
 class LangChainDeepSeekDecisionEngine:
     def __init__(self, settings: Settings) -> None:
         if settings.deepseek_api_key is None:
@@ -155,6 +190,40 @@ class LangChainDeepSeekDecisionEngine:
         except Exception:
             return await self._fallback.decide_speech(context)
 
+    async def review_pending_speech(self, context: PendingSpeechContext) -> PendingSpeechDecision:
+        prompt = build_pending_speech_review_prompt(context)
+        try:
+            data = parse_json_object(await self._invoke(prompt))
+            action = data.get("action")
+            if action not in {"send_original", "send_revised", "discard", "wait"}:
+                return await self._fallback.review_pending_speech(context)
+            message = data.get("message")
+            if action == "send_original":
+                return PendingSpeechDecision(
+                    action="send_original",
+                    message=context.original_message,
+                    reason=str(data.get("reason") or ""),
+                )
+            if action == "send_revised":
+                if not isinstance(message, str) or not message.strip():
+                    return await self._fallback.review_pending_speech(context)
+                return PendingSpeechDecision(
+                    action="send_revised",
+                    message=message.strip()[:300],
+                    reason=str(data.get("reason") or ""),
+                )
+            if action == "wait":
+                extra_delay = data.get("extraDelaySeconds")
+                return PendingSpeechDecision(
+                    action="wait",
+                    message=None,
+                    reason=str(data.get("reason") or ""),
+                    extra_delay_seconds=float(extra_delay) if isinstance(extra_delay, (int, float)) else 3.0,
+                )
+            return PendingSpeechDecision(action="discard", reason=str(data.get("reason") or ""))
+        except Exception:
+            return await self._fallback.review_pending_speech(context)
+
     async def decide_vote(self, context: DecisionContext) -> VoteDecision:
         prompt = build_vote_prompt(context)
         try:
@@ -183,6 +252,17 @@ def _jsonable_context(context: DecisionContext) -> dict[str, Any]:
         "roomState": context.room_state,
         "messages": context.messages[-20:],
         "candidatePlayerIds": context.candidate_player_ids,
+    }
+
+
+def _jsonable_pending_speech_context(context: PendingSpeechContext) -> dict[str, Any]:
+    return {
+        "roomCode": context.room_code,
+        "aiPlayerId": context.ai_player_id,
+        "roomState": context.room_state,
+        "messages": context.messages[-20:],
+        "originalMessage": context.original_message,
+        "newMessages": context.new_messages[-10:],
     }
 
 

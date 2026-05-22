@@ -10,7 +10,13 @@ from typing import Any
 import httpx
 
 from .config import Settings
-from .decision import DecisionContext, DecisionEngine, RuleBasedDecisionEngine
+from .decision import (
+    DecisionContext,
+    DecisionEngine,
+    PendingSpeechContext,
+    PendingSpeechDecision,
+    RuleBasedDecisionEngine,
+)
 from .java_client import JavaAgentClient
 from .models import AgentEvent, AgentEventType
 
@@ -19,11 +25,22 @@ logger = logging.getLogger("uvicorn.error")
 
 
 @dataclass
+class PendingSpeechTask:
+    ai_player_id: str
+    original_message: str
+    created_after_message_id: str | None
+    due_at: float
+    context_changed: bool = False
+    review_count: int = 0
+
+
+@dataclass
 class RoomMemory:
     ai_player_ids: set[str] = field(default_factory=set)
     processed_event_ids: set[str] = field(default_factory=set)
     attempted_votes: set[tuple[int, str]] = field(default_factory=set)
     pending_vote_payload: dict[str, Any] | None = None
+    pending_speeches: dict[str, PendingSpeechTask] = field(default_factory=dict)
     last_activity_at: float = field(default_factory=monotonic)
 
 
@@ -82,7 +99,8 @@ class AgentRuntime:
         elif event.type == AgentEventType.ROUND_STARTED:
             memory.attempted_votes.clear()
             memory.pending_vote_payload = None
-            logger.info("新回合开始：房间=%s，轮次=%s，已清空本轮 AI 投票记录。", room_code, event.payload.get("roundNumber"))
+            memory.pending_speeches.clear()
+            logger.info("新回合开始：房间=%s，轮次=%s，已清空本轮 AI 临时任务。", room_code, event.payload.get("roundNumber"))
         elif event.type in {AgentEventType.GAME_ENDED, AgentEventType.ROOM_DESTROYED}:
             self._rooms.pop(room_code, None)
             logger.info("房间状态已清理：房间=%s，事件类型=%s。", room_code, event.type)
@@ -103,17 +121,14 @@ class AgentRuntime:
             room_state = await self._java_client.get_room_state(room_code)
             self._sync_ai_players(memory, room_state)
             if room_state.get("status") != "CHATTING":
-                logger.info(
-                    "聊天事件暂不处理：房间=%s，当前状态=%s，不是讨论阶段。",
-                    room_code,
-                    room_state.get("status"),
-                )
+                logger.info("聊天事件暂不处理：房间=%s，当前状态=%s，不是讨论阶段。", room_code, room_state.get("status"))
                 return
             messages_response = await self._java_client.get_messages(room_code, self._settings.message_history_limit)
         except (httpx.HTTPError, RuntimeError) as exc:
             logger.warning("处理聊天事件失败：房间=%s，无法从 Java 查询状态或消息，错误=%s。", room_code, exc)
             return
 
+        messages = messages_response.get("messages", [])
         alive_ai_player_ids = self._alive_ai_player_ids(room_state, memory)
         if not alive_ai_player_ids:
             logger.info("聊天事件无需发言：房间=%s，没有存活的 AI 玩家。", room_code)
@@ -124,103 +139,153 @@ class AgentRuntime:
             room_code,
             sender_player_id,
             alive_ai_player_ids,
-            len(messages_response.get("messages", [])),
+            len(messages),
         )
         for ai_player_id in alive_ai_player_ids:
             if ai_player_id == sender_player_id:
                 continue
+            pending = memory.pending_speeches.get(ai_player_id)
+            if pending is not None:
+                pending.context_changed = True
+                logger.info(
+                    "AI 正在模拟打字，新消息已标记为上下文变化：房间=%s，AI玩家=%s，发言玩家=%s。",
+                    room_code,
+                    ai_player_id,
+                    sender_player_id,
+                )
+                continue
+
             context = DecisionContext(
                 room_code=room_code,
                 ai_player_id=ai_player_id,
                 room_state=room_state,
-                messages=messages_response.get("messages", []),
+                messages=messages,
             )
             decision = await self._decision_engine.decide_speech(context)
             message = (decision.message or "").strip()
             if decision.should_speak and message:
-                try:
-                    await self._java_client.send_message(room_code, ai_player_id, message[:300])
-                    logger.info("AI 已提交发言：房间=%s，AI玩家=%s，内容=%s。", room_code, ai_player_id, _short_text(message))
-                except (httpx.HTTPError, RuntimeError) as exc:
-                    logger.warning("AI 发言提交失败：房间=%s，AI玩家=%s，错误=%s。", room_code, ai_player_id, exc)
+                await self._schedule_speech(room_code, memory, ai_player_id, message[:300], messages)
             else:
                 logger.info("AI 决定保持沉默：房间=%s，AI玩家=%s。", room_code, ai_player_id)
 
-    async def _handle_voting_started(self, room_code: str, payload: dict[str, Any]) -> None:
-        memory = self.room_memory(room_code)
-        memory.pending_vote_payload = dict(payload)
-        await self._attempt_votes(room_code, memory, memory.pending_vote_payload, "投票开始事件")
-        return
+        await self.run_pending_speech_checks()
+
+    async def _schedule_speech(
+        self,
+        room_code: str,
+        memory: RoomMemory,
+        ai_player_id: str,
+        message: str,
+        messages: list[dict[str, Any]],
+    ) -> None:
+        delay_seconds = self._speech_delay_seconds(message)
+        task = PendingSpeechTask(
+            ai_player_id=ai_player_id,
+            original_message=message,
+            created_after_message_id=_last_message_id(messages),
+            due_at=monotonic() + delay_seconds,
+        )
+        memory.pending_speeches[ai_player_id] = task
+        logger.info(
+            "AI 已生成待发送草稿：房间=%s，AI玩家=%s，字数=%s，预计等待=%.2f秒，内容=%s。",
+            room_code,
+            ai_player_id,
+            len(message),
+            delay_seconds,
+            _short_text(message),
+        )
+
+    def _speech_delay_seconds(self, message: str) -> float:
+        raw_delay = self._settings.speech_base_delay_seconds + len(message) * self._settings.speech_typing_seconds_per_char
+        return max(0.0, min(raw_delay, self._settings.speech_max_delay_seconds))
+
+    async def run_pending_speech_checks(self) -> None:
+        now = monotonic()
+        for room_code, memory in list(self._rooms.items()):
+            for ai_player_id, task in list(memory.pending_speeches.items()):
+                if task.due_at > now:
+                    continue
+                await self._process_pending_speech(room_code, memory, ai_player_id, task, now)
+
+    async def _process_pending_speech(
+        self,
+        room_code: str,
+        memory: RoomMemory,
+        ai_player_id: str,
+        task: PendingSpeechTask,
+        now: float,
+    ) -> None:
         try:
             room_state = await self._java_client.get_room_state(room_code)
             self._sync_ai_players(memory, room_state)
-            if room_state.get("status") != "VOTING":
-                logger.info(
-                    "投票事件暂不处理：房间=%s，当前状态=%s，不是投票阶段。",
-                    room_code,
-                    room_state.get("status"),
-                )
+            if room_state.get("status") != "CHATTING":
+                memory.pending_speeches.pop(ai_player_id, None)
+                logger.info("丢弃待发送发言：房间=%s，AI玩家=%s，当前状态=%s，不是讨论阶段。", room_code, ai_player_id, room_state.get("status"))
+                return
+            if ai_player_id not in self._alive_ai_player_ids(room_state, memory):
+                memory.pending_speeches.pop(ai_player_id, None)
+                logger.info("丢弃待发送发言：房间=%s，AI玩家=%s 已不再存活。", room_code, ai_player_id)
                 return
             messages_response = await self._java_client.get_messages(room_code, self._settings.message_history_limit)
-            votes_response = await self._java_client.get_votes(room_code)
         except (httpx.HTTPError, RuntimeError) as exc:
-            logger.warning("处理投票事件失败：房间=%s，无法从 Java 查询状态、消息或投票信息，错误=%s。", room_code, exc)
+            task.due_at = now + self._settings.speech_retry_delay_seconds
+            logger.warning("待发送发言复核失败，将稍后重试：房间=%s，AI玩家=%s，错误=%s。", room_code, ai_player_id, exc)
             return
 
-        round_number = int(payload.get("roundNumber") or votes_response.get("roundNumber") or 0)
-        raw_candidates = votes_response.get("candidatePlayerIds") or payload.get("candidatePlayerIds") or []
-        alive_player_ids = {
-            player.get("playerId")
-            for player in room_state.get("players", [])
-            if player.get("alive") is True
-        }
-
-        alive_ai_player_ids = self._alive_ai_player_ids(room_state, memory)
-        logger.info(
-            "开始分析投票事件：房间=%s，轮次=%s，存活AI=%s，候选人=%s。",
-            room_code,
-            round_number,
-            alive_ai_player_ids,
-            raw_candidates,
-        )
-        for ai_player_id in alive_ai_player_ids:
-            vote_key = (round_number, ai_player_id)
-            if vote_key in memory.attempted_votes:
-                logger.info("跳过重复投票：房间=%s，轮次=%s，AI玩家=%s。", room_code, round_number, ai_player_id)
-                continue
-            candidates = [
-                str(player_id)
-                for player_id in raw_candidates
-                if player_id != ai_player_id and player_id in alive_player_ids
-            ]
-            if not candidates:
-                logger.info("AI 无合法投票目标：房间=%s，AI玩家=%s。", room_code, ai_player_id)
-                continue
-
-            context = DecisionContext(
+        messages = messages_response.get("messages", [])
+        new_messages = _messages_after(task.created_after_message_id, messages)
+        context_changed = task.context_changed or bool(new_messages)
+        decision = PendingSpeechDecision(action="send_original", message=task.original_message)
+        if context_changed:
+            review = getattr(self._decision_engine, "review_pending_speech", None)
+            if review is None:
+                review = RuleBasedDecisionEngine().review_pending_speech
+            context = PendingSpeechContext(
                 room_code=room_code,
                 ai_player_id=ai_player_id,
                 room_state=room_state,
-                messages=messages_response.get("messages", []),
-                candidate_player_ids=candidates,
+                messages=messages,
+                original_message=task.original_message,
+                new_messages=new_messages,
             )
-            decision = await self._decision_engine.decide_vote(context)
-            target = decision.target_player_id
-            if target not in candidates:
-                fallback = await RuleBasedDecisionEngine().decide_vote(context)
-                target = fallback.target_player_id
-                reason = fallback.reason
-            else:
-                reason = decision.reason
-            if target is None:
-                logger.info("AI 决定暂不投票：房间=%s，AI玩家=%s。", room_code, ai_player_id)
-                continue
-            memory.attempted_votes.add(vote_key)
-            try:
-                await self._java_client.cast_vote(room_code, ai_player_id, target, reason)
-                logger.info("AI 已提交投票：房间=%s，轮次=%s，AI玩家=%s，目标=%s，原因=%s。", room_code, round_number, ai_player_id, target, reason)
-            except (httpx.HTTPError, RuntimeError) as exc:
-                logger.warning("AI 投票提交失败：房间=%s，轮次=%s，AI玩家=%s，目标=%s，错误=%s。", room_code, round_number, ai_player_id, target, exc)
+            decision = await review(context)
+
+        action = decision.action
+        if action == "wait":
+            if task.review_count >= self._settings.pending_speech_max_reviews:
+                memory.pending_speeches.pop(ai_player_id, None)
+                logger.info("丢弃待发送发言：房间=%s，AI玩家=%s，复核等待次数已达到上限。", room_code, ai_player_id)
+                return
+            task.review_count += 1
+            delay = decision.extra_delay_seconds if decision.extra_delay_seconds > 0 else self._settings.speech_retry_delay_seconds
+            task.due_at = now + min(delay, self._settings.speech_max_delay_seconds)
+            logger.info("AI 决定再等一会儿：房间=%s，AI玩家=%s，等待=%.2f秒，原因=%s。", room_code, ai_player_id, delay, decision.reason)
+            return
+        if action == "discard":
+            memory.pending_speeches.pop(ai_player_id, None)
+            logger.info("AI 丢弃过期待发送发言：房间=%s，AI玩家=%s，原因=%s。", room_code, ai_player_id, decision.reason)
+            return
+
+        message = task.original_message if action == "send_original" else (decision.message or "").strip()
+        if not message:
+            memory.pending_speeches.pop(ai_player_id, None)
+            logger.info("丢弃待发送发言：房间=%s，AI玩家=%s，复核后消息为空。", room_code, ai_player_id)
+            return
+
+        try:
+            await self._java_client.send_message(room_code, ai_player_id, message[:300])
+            memory.pending_speeches.pop(ai_player_id, None)
+            logger.info("AI 已提交发言：房间=%s，AI玩家=%s，动作=%s，内容=%s。", room_code, ai_player_id, action, _short_text(message))
+        except (httpx.HTTPError, RuntimeError) as exc:
+            task.due_at = now + self._settings.speech_retry_delay_seconds
+            logger.warning("AI 发言提交失败，将稍后重试：房间=%s，AI玩家=%s，错误=%s。", room_code, ai_player_id, exc)
+
+    async def _handle_voting_started(self, room_code: str, payload: dict[str, Any]) -> None:
+        memory = self.room_memory(room_code)
+        memory.pending_speeches.clear()
+        memory.pending_vote_payload = dict(payload)
+        logger.info("进入投票阶段：房间=%s，已丢弃待发送聊天草稿。", room_code)
+        await self._attempt_votes(room_code, memory, memory.pending_vote_payload, "投票开始事件")
 
     async def _attempt_votes(
         self,
@@ -233,22 +298,12 @@ class AgentRuntime:
             room_state = await self._java_client.get_room_state(room_code)
             self._sync_ai_players(memory, room_state)
             if room_state.get("status") != "VOTING":
-                logger.info(
-                    "投票暂不处理：触发=%s，房间=%s，当前状态=%s，不是投票阶段。",
-                    trigger,
-                    room_code,
-                    room_state.get("status"),
-                )
+                logger.info("投票暂不处理：触发=%s，房间=%s，当前状态=%s，不是投票阶段。", trigger, room_code, room_state.get("status"))
                 return
             messages_response = await self._java_client.get_messages(room_code, self._settings.message_history_limit)
             votes_response = await self._java_client.get_votes(room_code)
         except (httpx.HTTPError, RuntimeError) as exc:
-            logger.warning(
-                "处理投票失败：触发=%s，房间=%s，无法从 Java 查询状态、消息或投票信息，错误=%s。",
-                trigger,
-                room_code,
-                exc,
-            )
+            logger.warning("处理投票失败：触发=%s，房间=%s，无法从 Java 查询状态、消息或投票信息，错误=%s。", trigger, room_code, exc)
             return
 
         round_number = int(payload.get("roundNumber") or votes_response.get("roundNumber") or 0)
@@ -281,13 +336,7 @@ class AgentRuntime:
                 if str(player_id) != ai_player_id and str(player_id) in alive_player_ids
             ]
             if not candidates:
-                logger.info(
-                    "AI 无合法投票目标：房间=%s，AI玩家=%s，原始候选人=%s，存活玩家=%s。",
-                    room_code,
-                    ai_player_id,
-                    raw_candidates,
-                    sorted(alive_player_ids),
-                )
+                logger.info("AI 无合法投票目标：房间=%s，AI玩家=%s，原始候选人=%s，存活玩家=%s。", room_code, ai_player_id, raw_candidates, sorted(alive_player_ids))
                 continue
 
             context = DecisionContext(
@@ -311,25 +360,9 @@ class AgentRuntime:
             try:
                 await self._java_client.cast_vote(room_code, ai_player_id, target, reason)
                 memory.attempted_votes.add(vote_key)
-                logger.info(
-                    "AI 已提交投票：触发=%s，房间=%s，轮次=%s，AI玩家=%s，目标=%s，原因=%s。",
-                    trigger,
-                    room_code,
-                    round_number,
-                    ai_player_id,
-                    target,
-                    reason,
-                )
+                logger.info("AI 已提交投票：触发=%s，房间=%s，轮次=%s，AI玩家=%s，目标=%s，原因=%s。", trigger, room_code, round_number, ai_player_id, target, reason)
             except (httpx.HTTPError, RuntimeError) as exc:
-                logger.warning(
-                    "AI 投票提交失败，将等待下一次周期检查重试：触发=%s，房间=%s，轮次=%s，AI玩家=%s，目标=%s，错误=%s。",
-                    trigger,
-                    room_code,
-                    round_number,
-                    ai_player_id,
-                    target,
-                    exc,
-                )
+                logger.warning("AI 投票提交失败，将等待下一次周期检查重试：触发=%s，房间=%s，轮次=%s，AI玩家=%s，目标=%s，错误=%s。", trigger, room_code, round_number, ai_player_id, target, exc)
 
         if alive_ai_player_ids and all((round_number, ai_player_id) in memory.attempted_votes for ai_player_id in alive_ai_player_ids):
             memory.pending_vote_payload = None
@@ -354,10 +387,13 @@ class AgentRuntime:
             await self.run_idle_checks()
 
     async def run_idle_checks(self) -> None:
+        await self.run_pending_speech_checks()
         now = monotonic()
         for room_code, memory in list(self._rooms.items()):
             if memory.pending_vote_payload is not None:
                 await self._attempt_votes(room_code, memory, memory.pending_vote_payload, "周期投票检查")
+            if memory.pending_speeches:
+                continue
             if now - memory.last_activity_at < self._settings.idle_speech_after_seconds:
                 continue
             memory.last_activity_at = now
@@ -368,11 +404,7 @@ class AgentRuntime:
         try:
             room_state = await self._java_client.get_room_state(room_code)
             if room_state.get("status") != "CHATTING":
-                logger.info(
-                    "空闲检查暂不发言：房间=%s，当前状态=%s，不是讨论阶段。",
-                    room_code,
-                    room_state.get("status"),
-                )
+                logger.info("空闲检查暂不发言：房间=%s，当前状态=%s，不是讨论阶段。", room_code, room_state.get("status"))
                 return
             messages_response = await self._java_client.get_messages(room_code, self._settings.message_history_limit)
         except (httpx.HTTPError, RuntimeError) as exc:
@@ -381,23 +413,39 @@ class AgentRuntime:
 
         memory = self.room_memory(room_code)
         self._sync_ai_players(memory, room_state)
+        messages = messages_response.get("messages", [])
         for ai_player_id in self._alive_ai_player_ids(room_state, memory):
+            if ai_player_id in memory.pending_speeches:
+                continue
             context = DecisionContext(
                 room_code=room_code,
                 ai_player_id=ai_player_id,
                 room_state=room_state,
-                messages=messages_response.get("messages", []),
+                messages=messages,
             )
             decision = await self._decision_engine.decide_speech(context)
             message = (decision.message or "").strip()
             if decision.should_speak and message:
-                try:
-                    await self._java_client.send_message(room_code, ai_player_id, message[:300])
-                    logger.info("AI 已提交空闲发言：房间=%s，AI玩家=%s，内容=%s。", room_code, ai_player_id, _short_text(message))
-                except (httpx.HTTPError, RuntimeError) as exc:
-                    logger.warning("AI 空闲发言提交失败：房间=%s，AI玩家=%s，错误=%s。", room_code, ai_player_id, exc)
+                await self._schedule_speech(room_code, memory, ai_player_id, message[:300], messages)
             else:
                 logger.info("空闲检查后 AI 保持沉默：房间=%s，AI玩家=%s。", room_code, ai_player_id)
+        await self.run_pending_speech_checks()
+
+
+def _last_message_id(messages: list[dict[str, Any]]) -> str | None:
+    if not messages:
+        return None
+    message_id = messages[-1].get("messageId")
+    return str(message_id) if message_id is not None else None
+
+
+def _messages_after(message_id: str | None, messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    if message_id is None:
+        return messages
+    for index, message in enumerate(messages):
+        if str(message.get("messageId")) == message_id:
+            return messages[index + 1 :]
+    return messages
 
 
 def _short_text(text: str, limit: int = 80) -> str:

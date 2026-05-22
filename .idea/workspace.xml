@@ -1,0 +1,118 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project version="4">
+  <component name="AutoImportSettings">
+    <option name="autoReloadType" value="SELECTIVE" />
+  </component>
+  <component name="ChangeListManager">
+    <list default="true" id="3f28c88a-8bb8-4a1a-bb68-681de51a9939" name="更改" comment="feat(runtime): 实现 AI 游戏代理完整运行时逻辑&#10;&#10;- 新增 AgentRuntime 以管理房间状态、处理游戏事件、AI 发言与投票&#10;- 实现空闲检测机制，支持空闲时自动发言功能&#10;- 支持处理多种事件类型：房间开始、聊天消息、投票开始、回合开始、游戏结束等&#10;- 集成决策引擎，分别使用规则引擎和基于 LangChain DeepSeek 的 AI 决策&#10;- 实现与 Java 服务的异步 HTTP 交互以获取游戏状态、消息和提交行动&#10;- 定义并使用 RoomMemory 保存每个房间的 AI 玩家列表和已处理事件&#10;- 实现内部请求身份验证，保证 API 安全性&#10;- 新增 FastAPI 应用构建、请求验证错误处理及日志记录&#10;- 提供配置管理与环境变量支持，参数覆盖可定制行为&#10;- 集成运行入口，使用 uvicorn 进行 HTTP 服务启动&#10;- 结构清晰，代码模块化分层，方便后续扩展与维护">
+      <change afterPath="$PROJECT_DIR$/.idea/deep-cover-agent.iml" afterDir="false" />
+      <change afterPath="$PROJECT_DIR$/.idea/inspectionProfiles/Project_Default.xml" afterDir="false" />
+      <change afterPath="$PROJECT_DIR$/.idea/inspectionProfiles/profiles_settings.xml" afterDir="false" />
+      <change afterPath="$PROJECT_DIR$/.idea/modules.xml" afterDir="false" />
+      <change afterPath="$PROJECT_DIR$/.idea/vcs.xml" afterDir="false" />
+      <change afterPath="$PROJECT_DIR$/.idea/workspace.xml" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/src/deep_cover_agent/config.py" beforeDir="false" afterPath="$PROJECT_DIR$/src/deep_cover_agent/config.py" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/src/deep_cover_agent/decision.py" beforeDir="false" afterPath="$PROJECT_DIR$/src/deep_cover_agent/decision.py" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/src/deep_cover_agent/runtime.py" beforeDir="false" afterPath="$PROJECT_DIR$/src/deep_cover_agent/runtime.py" afterDir="false" />
+    </list>
+    <option name="SHOW_DIALOG" value="false" />
+    <option name="HIGHLIGHT_CONFLICTS" value="true" />
+    <option name="HIGHLIGHT_NON_ACTIVE_CHANGELIST" value="false" />
+    <option name="LAST_RESOLUTION" value="IGNORE" />
+  </component>
+  <component name="CopilotPersistence">
+    <persistenceIdMap>
+      <entry key="_D:/python_work/deep-cover-agent" value="3Dk39YtHRn1MGpUJ4krgUWLTfEa" />
+    </persistenceIdMap>
+  </component>
+  <component name="Git.Settings">
+    <option name="RECENT_GIT_ROOT_PATH" value="$PROJECT_DIR$" />
+  </component>
+  <component name="ProjectColorInfo">{
+  &quot;associatedIndex&quot;: 2
+}</component>
+  <component name="ProjectId" id="3Dk39YtHRn1MGpUJ4krgUWLTfEa" />
+  <component name="ProjectViewState">
+    <option name="hideEmptyMiddlePackages" value="true" />
+    <option name="showLibraryContents" value="true" />
+  </component>
+  <component name="PropertiesComponent">{
+  &quot;keyToString&quot;: {
+    &quot;ModuleVcsDetector.initialDetectionPerformed&quot;: &quot;true&quot;,
+    &quot;Python.main.executor&quot;: &quot;Run&quot;,
+    &quot;RunOnceActivity.ShowReadmeOnStart&quot;: &quot;true&quot;,
+    &quot;RunOnceActivity.TerminalTabsStorage.copyFrom.TerminalArrangementManager.252&quot;: &quot;true&quot;,
+    &quot;RunOnceActivity.git.unshallow&quot;: &quot;true&quot;,
+    &quot;git-widget-placeholder&quot;: &quot;master&quot;,
+    &quot;settings.editor.selected.configurable&quot;: &quot;com.jetbrains.python.configuration.PyActiveSdkModuleConfigurable&quot;
+  }
+}</component>
+  <component name="RunManager">
+    <configuration name="main" type="PythonConfigurationType" factoryName="Python" temporary="true" nameIsGenerated="true">
+      <module name="deep-cover-agent" />
+      <option name="ENV_FILES" value="" />
+      <option name="INTERPRETER_OPTIONS" value="" />
+      <option name="PARENT_ENVS" value="true" />
+      <envs>
+        <env name="PYTHONUNBUFFERED" value="1" />
+      </envs>
+      <option name="SDK_HOME" value="" />
+      <option name="WORKING_DIRECTORY" value="$PROJECT_DIR$/src/deep_cover_agent" />
+      <option name="IS_MODULE_SDK" value="true" />
+      <option name="ADD_CONTENT_ROOTS" value="true" />
+      <option name="ADD_SOURCE_ROOTS" value="true" />
+      <option name="RUN_TOOL" value="" />
+      <option name="SCRIPT_NAME" value="$PROJECT_DIR$/src/deep_cover_agent/main.py" />
+      <option name="PARAMETERS" value="" />
+      <option name="SHOW_COMMAND_LINE" value="false" />
+      <option name="EMULATE_TERMINAL" value="false" />
+      <option name="MODULE_MODE" value="false" />
+      <option name="REDIRECT_INPUT" value="false" />
+      <option name="INPUT_FILE" value="" />
+      <method v="2" />
+    </configuration>
+    <recent_temporary>
+      <list>
+        <item itemvalue="Python.main" />
+      </list>
+    </recent_temporary>
+  </component>
+  <component name="SharedIndexes">
+    <attachedChunks>
+      <set>
+        <option value="bundled-python-sdk-2653e85de345-6d6dccd035ac-com.jetbrains.pycharm.pro.sharedIndexes.bundled-PY-253.31033.139" />
+      </set>
+    </attachedChunks>
+  </component>
+  <component name="TaskManager">
+    <task active="true" id="Default" summary="默认任务">
+      <changelist id="3f28c88a-8bb8-4a1a-bb68-681de51a9939" name="更改" comment="" />
+      <created>1778812091781</created>
+      <option name="number" value="Default" />
+      <option name="presentableId" value="Default" />
+      <updated>1778812091781</updated>
+    </task>
+    <task id="LOCAL-00001" summary="feat(runtime): 实现 AI 游戏代理完整运行时逻辑&#10;&#10;- 新增 AgentRuntime 以管理房间状态、处理游戏事件、AI 发言与投票&#10;- 实现空闲检测机制，支持空闲时自动发言功能&#10;- 支持处理多种事件类型：房间开始、聊天消息、投票开始、回合开始、游戏结束等&#10;- 集成决策引擎，分别使用规则引擎和基于 LangChain DeepSeek 的 AI 决策&#10;- 实现与 Java 服务的异步 HTTP 交互以获取游戏状态、消息和提交行动&#10;- 定义并使用 RoomMemory 保存每个房间的 AI 玩家列表和已处理事件&#10;- 实现内部请求身份验证，保证 API 安全性&#10;- 新增 FastAPI 应用构建、请求验证错误处理及日志记录&#10;- 提供配置管理与环境变量支持，参数覆盖可定制行为&#10;- 集成运行入口，使用 uvicorn 进行 HTTP 服务启动&#10;- 结构清晰，代码模块化分层，方便后续扩展与维护">
+      <option name="closed" value="true" />
+      <created>1779335933966</created>
+      <option name="number" value="00001" />
+      <option name="presentableId" value="LOCAL-00001" />
+      <option name="project" value="LOCAL" />
+      <updated>1779335933966</updated>
+    </task>
+    <option name="localTasksCounter" value="2" />
+    <servers />
+  </component>
+  <component name="VcsManagerConfiguration">
+    <MESSAGE value="feat(runtime): 实现 AI 游戏代理完整运行时逻辑&#10;&#10;- 新增 AgentRuntime 以管理房间状态、处理游戏事件、AI 发言与投票&#10;- 实现空闲检测机制，支持空闲时自动发言功能&#10;- 支持处理多种事件类型：房间开始、聊天消息、投票开始、回合开始、游戏结束等&#10;- 集成决策引擎，分别使用规则引擎和基于 LangChain DeepSeek 的 AI 决策&#10;- 实现与 Java 服务的异步 HTTP 交互以获取游戏状态、消息和提交行动&#10;- 定义并使用 RoomMemory 保存每个房间的 AI 玩家列表和已处理事件&#10;- 实现内部请求身份验证，保证 API 安全性&#10;- 新增 FastAPI 应用构建、请求验证错误处理及日志记录&#10;- 提供配置管理与环境变量支持，参数覆盖可定制行为&#10;- 集成运行入口，使用 uvicorn 进行 HTTP 服务启动&#10;- 结构清晰，代码模块化分层，方便后续扩展与维护" />
+    <option name="LAST_COMMIT_MESSAGE" value="feat(runtime): 实现 AI 游戏代理完整运行时逻辑&#10;&#10;- 新增 AgentRuntime 以管理房间状态、处理游戏事件、AI 发言与投票&#10;- 实现空闲检测机制，支持空闲时自动发言功能&#10;- 支持处理多种事件类型：房间开始、聊天消息、投票开始、回合开始、游戏结束等&#10;- 集成决策引擎，分别使用规则引擎和基于 LangChain DeepSeek 的 AI 决策&#10;- 实现与 Java 服务的异步 HTTP 交互以获取游戏状态、消息和提交行动&#10;- 定义并使用 RoomMemory 保存每个房间的 AI 玩家列表和已处理事件&#10;- 实现内部请求身份验证，保证 API 安全性&#10;- 新增 FastAPI 应用构建、请求验证错误处理及日志记录&#10;- 提供配置管理与环境变量支持，参数覆盖可定制行为&#10;- 集成运行入口，使用 uvicorn 进行 HTTP 服务启动&#10;- 结构清晰，代码模块化分层，方便后续扩展与维护" />
+  </component>
+  <component name="github-copilot-workspace">
+    <instructionFileLocations>
+      <option value=".github/instructions" />
+    </instructionFileLocations>
+    <promptFileLocations>
+      <option value=".github/prompts" />
+    </promptFileLocations>
+  </component>
+</project>
