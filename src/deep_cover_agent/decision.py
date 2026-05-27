@@ -182,6 +182,7 @@ class LangChainDeepSeekDecisionEngine:
             temperature=settings.deepseek_temperature,
             timeout=settings.deepseek_timeout_seconds,
             max_retries=settings.deepseek_max_retries,
+            extra_body={"thinking": {"type": "enabled" if settings.deepseek_thinking_enabled else "disabled"}},
         )
         tools = build_agent_query_tools(java_client, settings.message_history_limit) if java_client is not None else []
         self._agent = create_agent(
@@ -201,8 +202,8 @@ class LangChainDeepSeekDecisionEngine:
             if not should_speak or not isinstance(message, str) or not message.strip():
                 return SpeechDecision(should_speak=False)
             return SpeechDecision(should_speak=True, message=message.strip()[:300])
-        except Exception:
-            logger.warning("AI 发言决策失败，改为保持沉默。", exc_info=True)
+        except Exception as exc:
+            logger.warning("[模型] speech_failed fallback=silent error=%s", _error_summary(exc))
             return await self._fallback.decide_speech(context)
 
     async def review_pending_speech(self, context: PendingSpeechContext) -> PendingSpeechDecision:
@@ -211,7 +212,7 @@ class LangChainDeepSeekDecisionEngine:
             data = parse_json_object(await self._invoke(prompt))
             action = data.get("action")
             if action not in {"send_original", "send_revised", "discard", "wait"}:
-                logger.warning("待发送发言复核返回了非法动作，已丢弃旧草稿：action=%s。", action)
+                logger.warning("[模型] review_invalid_action action=%s fallback=discard", action)
                 return PendingSpeechDecision(action="discard", reason="复核返回非法动作，已丢弃旧草稿。")
             message = data.get("message")
             if action == "send_original":
@@ -222,7 +223,7 @@ class LangChainDeepSeekDecisionEngine:
                 )
             if action == "send_revised":
                 if not isinstance(message, str) or not message.strip():
-                    logger.warning("待发送发言复核要求改写，但 message 为空，已丢弃旧草稿。")
+                    logger.warning("[模型] review_empty_revision fallback=discard")
                     return PendingSpeechDecision(action="discard", reason="复核改写内容为空，已丢弃旧草稿。")
                 return PendingSpeechDecision(
                     action="send_revised",
@@ -238,8 +239,8 @@ class LangChainDeepSeekDecisionEngine:
                     extra_delay_seconds=float(extra_delay) if isinstance(extra_delay, (int, float)) else 3.0,
                 )
             return PendingSpeechDecision(action="discard", reason=str(data.get("reason") or ""))
-        except Exception:
-            logger.warning("待发送发言复核失败，已丢弃旧草稿，避免发送过期上下文。", exc_info=True)
+        except Exception as exc:
+            logger.warning("[模型] review_failed fallback=discard error=%s", _error_summary(exc))
             return PendingSpeechDecision(action="discard", reason="复核失败，已丢弃旧草稿。")
 
     async def decide_vote(self, context: DecisionContext) -> VoteDecision:
@@ -251,8 +252,8 @@ class LangChainDeepSeekDecisionEngine:
             if isinstance(target, str) and target in context.candidate_player_ids and target != context.ai_player_id:
                 return VoteDecision(target_player_id=target, reason=reason)
             return await self._fallback.decide_vote(context)
-        except Exception:
-            logger.warning("AI 投票决策失败，使用兜底投票策略。", exc_info=True)
+        except Exception as exc:
+            logger.warning("[模型] vote_failed fallback=rule error=%s", _error_summary(exc))
             return await self._fallback.decide_vote(context)
 
     async def _invoke(self, prompt: str) -> str:
@@ -324,3 +325,10 @@ def _extract_message_text(result: Any) -> str:
     if inspect.isawaitable(result):
         raise TypeError("Unexpected awaitable result from LangChain agent.")
     return str(result)
+
+
+def _error_summary(exc: Exception) -> str:
+    message = str(exc).replace("\n", " ")
+    if len(message) > 160:
+        message = message[:157] + "..."
+    return f"{exc.__class__.__name__}: {message}"
