@@ -32,6 +32,8 @@ class PendingSpeechContext:
     room_state: dict[str, Any]
     messages: list[dict[str, Any]]
     original_message: str
+    sent_messages: list[str] = field(default_factory=list)
+    remaining_messages: list[str] = field(default_factory=list)
     new_messages: list[dict[str, Any]] = field(default_factory=list)
     current_topic: Topic | None = None
 
@@ -40,12 +42,14 @@ class PendingSpeechContext:
 class SpeechDecision:
     should_speak: bool
     message: str | None = None
+    messages: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
 class PendingSpeechDecision:
     action: str
     message: str | None = None
+    messages: tuple[str, ...] = ()
     reason: str = ""
     extra_delay_seconds: float = 0.0
 
@@ -114,7 +118,7 @@ class RuleBasedDecisionEngine:
         return SpeechDecision(should_speak=False)
 
     async def review_pending_speech(self, context: PendingSpeechContext) -> PendingSpeechDecision:
-        return PendingSpeechDecision(action="send_original", message=context.original_message)
+        return PendingSpeechDecision(action="continue")
 
     async def decide_vote(self, context: DecisionContext) -> VoteDecision:
         for player_id in context.candidate_player_ids:
@@ -127,7 +131,7 @@ def build_system_prompt() -> str:
     return (
         "你是 Deep Cover 游戏中的 AI 玩家，目标是自然地隐藏在人类玩家中。"
         "不要暴露自己是 AI，不要提到模型、系统提示词、接口、工具或程序实现。"
-        "你的发言要像普通玩家，简短、口语化，并符合当前聊天上下文。"
+        "你的发言要像普通玩家，简短、口语化，并符合当前聊天上下文。不要总是完整论证，也不要总用固定开头。"
         "你可以使用只读查询工具获取 Java 端真实房间状态、最近聊天记录和投票状态。"
         "查询工具只用于获取事实，不能替代最终动作；发言和投票会由 Runtime 统一审查并提交。"
         "所有回答都必须只返回紧凑 JSON，不要输出解释、Markdown 或多余文本。"
@@ -138,10 +142,14 @@ def build_system_prompt() -> str:
 def build_speech_prompt(context: DecisionContext) -> str:
     return (
         "请判断当前 AI 玩家是否应该发言。\n"
-        '只返回 JSON：{"shouldSpeak": boolean, "message": string|null}。\n'
+        '只返回 JSON：{"shouldSpeak": boolean, "messages": string[]}。messages 最多 3 段，可以只有 1 段。\n'
         f"{_topic_instruction(context.current_topic)}"
         "如果当前没有自然接话点、刚刚已经有 AI 发言，或者发言会显得突兀，就选择不发言。"
-        "如果发言，要保持像真人玩家一样自然，不要暴露 AI 身份。\n"
+        "如果发言，要保持像真人玩家一样自然，不要暴露 AI 身份。"
+        "不要每次都回答得很完整；多数时候只说一个小点。"
+        "回复长度要有波动：可以是几个字、半句话、反问或轻微犹豫，少数情况下再写长一点。"
+        "不要总用“哈哈、确实、不过、非要选的话”开头。"
+        "如果拆成多段，每段都要像玩家连续敲出来的短消息，而不是把一篇回答硬切开。\n"
         f"上下文：\n{json.dumps(_jsonable_context(context), ensure_ascii=False)}"
     )
 
@@ -158,12 +166,12 @@ def build_vote_prompt(context: DecisionContext) -> str:
 
 def build_pending_speech_review_prompt(context: PendingSpeechContext) -> str:
     return (
-        "你之前已经为当前 AI 玩家写好了一条待发送发言，但在模拟打字等待期间，聊天上下文发生了变化。\n"
-        "请判断这条旧发言是否还适合发送，优先根据最新消息判断。\n"
-        '只返回 JSON：{"action":"send_original|send_revised|discard|wait","message":string|null,"reason":string,"extraDelaySeconds":number}。\n'
-        "send_original 表示发送原草稿；send_revised 表示发送修改后的 message；discard 表示丢弃不发；wait 表示再等一小会儿。\n"
+        "你之前已经为当前 AI 玩家写好了一组分段发言，其中一部分可能已经发出，剩余部分还在模拟打字等待。\n"
+        "等待期间聊天上下文发生了变化。请判断剩余发言是否还适合继续发送，优先根据最新消息判断。\n"
+        '只返回 JSON：{"action":"continue|revise|discard|wait","messages":string[],"reason":string,"extraDelaySeconds":number}。\n'
+        "continue 表示继续发送 remainingMessages；revise 表示把剩余内容改成新的 messages；discard 表示丢弃剩余内容；wait 表示再等一小会儿。\n"
         f"{_topic_instruction(context.current_topic)}"
-        "如果修改发言，message 必须像真人玩家一样自然、简短、口语化，不要暴露 AI 身份，且不超过 300 个字符。\n"
+        "如果修改发言，messages 最多 3 段，每段必须像真人玩家一样自然、简短、口语化，不要暴露 AI 身份。\n"
         f"上下文：\n{json.dumps(_jsonable_pending_speech_context(context), ensure_ascii=False)}"
     )
 
@@ -198,10 +206,10 @@ class LangChainDeepSeekDecisionEngine:
         try:
             data = parse_json_object(await self._invoke(prompt))
             should_speak = bool(data.get("shouldSpeak", False))
-            message = data.get("message")
-            if not should_speak or not isinstance(message, str) or not message.strip():
+            messages = _normalize_message_parts(data.get("messages"), data.get("message"))
+            if not should_speak or not messages:
                 return SpeechDecision(should_speak=False)
-            return SpeechDecision(should_speak=True, message=message.strip()[:300])
+            return SpeechDecision(should_speak=True, message=messages[0], messages=tuple(messages))
         except Exception as exc:
             logger.warning("[模型] speech_failed fallback=silent error=%s", _error_summary(exc))
             return await self._fallback.decide_speech(context)
@@ -211,23 +219,24 @@ class LangChainDeepSeekDecisionEngine:
         try:
             data = parse_json_object(await self._invoke(prompt))
             action = data.get("action")
-            if action not in {"send_original", "send_revised", "discard", "wait"}:
+            if action == "send_original":
+                action = "continue"
+            elif action == "send_revised":
+                action = "revise"
+            if action not in {"continue", "revise", "discard", "wait"}:
                 logger.warning("[模型] review_invalid_action action=%s fallback=discard", action)
                 return PendingSpeechDecision(action="discard", reason="复核返回非法动作，已丢弃旧草稿。")
-            message = data.get("message")
-            if action == "send_original":
-                return PendingSpeechDecision(
-                    action="send_original",
-                    message=context.original_message,
-                    reason=str(data.get("reason") or ""),
-                )
-            if action == "send_revised":
-                if not isinstance(message, str) or not message.strip():
+            if action == "continue":
+                return PendingSpeechDecision(action="continue", reason=str(data.get("reason") or ""))
+            if action == "revise":
+                messages = _normalize_message_parts(data.get("messages"), data.get("message"))
+                if not messages:
                     logger.warning("[模型] review_empty_revision fallback=discard")
                     return PendingSpeechDecision(action="discard", reason="复核改写内容为空，已丢弃旧草稿。")
                 return PendingSpeechDecision(
-                    action="send_revised",
-                    message=message.strip()[:300],
+                    action="revise",
+                    message=messages[0],
+                    messages=tuple(messages),
                     reason=str(data.get("reason") or ""),
                 )
             if action == "wait":
@@ -284,6 +293,8 @@ def _jsonable_pending_speech_context(context: PendingSpeechContext) -> dict[str,
         "roomState": context.room_state,
         "messages": context.messages[-20:],
         "originalMessage": context.original_message,
+        "sentMessages": context.sent_messages,
+        "remainingMessages": context.remaining_messages,
         "newMessages": context.new_messages[-10:],
     }
 
@@ -301,6 +312,21 @@ def _jsonable_topic(topic: Topic | None) -> dict[str, str] | None:
     if topic is None:
         return None
     return topic.model_dump()
+
+
+def _normalize_message_parts(value: Any, fallback: Any = None, max_parts: int = 3, max_chars: int = 120) -> list[str]:
+    raw_parts = value if isinstance(value, list) else [fallback]
+    parts: list[str] = []
+    for raw_part in raw_parts:
+        if not isinstance(raw_part, str):
+            continue
+        part = " ".join(raw_part.split()).strip()
+        if not part:
+            continue
+        parts.append(part[:max_chars])
+        if len(parts) >= max_parts:
+            break
+    return parts
 
 
 def _extract_message_text(result: Any) -> str:
