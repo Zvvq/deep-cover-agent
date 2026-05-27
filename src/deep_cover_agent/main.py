@@ -11,6 +11,7 @@ def run() -> None:
         port=8000,
         reload=False,
         log_level="info",
+        access_log=False,
     )
 
 
