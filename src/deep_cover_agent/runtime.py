@@ -8,6 +8,7 @@ from time import monotonic
 from typing import Any
 
 import httpx
+from pydantic import ValidationError
 
 from .config import Settings
 from .decision import (
@@ -18,7 +19,7 @@ from .decision import (
     RuleBasedDecisionEngine,
 )
 from .java_client import JavaAgentClient
-from .models import AgentEvent, AgentEventType
+from .models import AgentEvent, AgentEventType, Topic
 
 
 logger = logging.getLogger("uvicorn.error")
@@ -41,6 +42,7 @@ class RoomMemory:
     attempted_votes: set[tuple[int, str]] = field(default_factory=set)
     pending_vote_payload: dict[str, Any] | None = None
     pending_speeches: dict[str, PendingSpeechTask] = field(default_factory=dict)
+    current_topic: Topic | None = None
     last_activity_at: float = field(default_factory=monotonic)
 
 
@@ -100,7 +102,13 @@ class AgentRuntime:
             memory.attempted_votes.clear()
             memory.pending_vote_payload = None
             memory.pending_speeches.clear()
-            logger.info("新回合开始：房间=%s，轮次=%s，已清空本轮 AI 临时任务。", room_code, event.payload.get("roundNumber"))
+            memory.current_topic = _topic_from_payload(event.payload.get("topic"))
+            logger.info(
+                "新回合开始：房间=%s，轮次=%s，当前话题=%s，已清空本轮 AI 临时任务。",
+                room_code,
+                event.payload.get("roundNumber"),
+                _topic_text(memory.current_topic),
+            )
         elif event.type in {AgentEventType.GAME_ENDED, AgentEventType.ROOM_DESTROYED}:
             self._rooms.pop(room_code, None)
             logger.info("房间状态已清理：房间=%s，事件类型=%s。", room_code, event.type)
@@ -108,7 +116,13 @@ class AgentRuntime:
     def _handle_room_started(self, memory: RoomMemory, payload: dict[str, Any]) -> None:
         ai_player_ids = payload.get("aiPlayerIds") or []
         memory.ai_player_ids.update(str(player_id) for player_id in ai_player_ids)
-        logger.info("房间开始：已记录 AI 玩家，数量=%s，AI玩家=%s。", len(memory.ai_player_ids), sorted(memory.ai_player_ids))
+        memory.current_topic = _topic_from_payload(payload.get("topic"))
+        logger.info(
+            "房间开始：已记录 AI 玩家，数量=%s，AI玩家=%s，当前话题=%s。",
+            len(memory.ai_player_ids),
+            sorted(memory.ai_player_ids),
+            _topic_text(memory.current_topic),
+        )
 
     async def _handle_chat_message(self, room_code: str, payload: dict[str, Any]) -> None:
         memory = self.room_memory(room_code)
@@ -120,6 +134,7 @@ class AgentRuntime:
         try:
             room_state = await self._java_client.get_room_state(room_code)
             self._sync_ai_players(memory, room_state)
+            self._sync_current_topic(memory, room_state)
             if room_state.get("status") != "CHATTING":
                 logger.info("聊天事件暂不处理：房间=%s，当前状态=%s，不是讨论阶段。", room_code, room_state.get("status"))
                 return
@@ -160,6 +175,7 @@ class AgentRuntime:
                 ai_player_id=ai_player_id,
                 room_state=room_state,
                 messages=messages,
+                current_topic=memory.current_topic,
             )
             decision = await self._decision_engine.decide_speech(context)
             message = (decision.message or "").strip()
@@ -218,6 +234,7 @@ class AgentRuntime:
         try:
             room_state = await self._java_client.get_room_state(room_code)
             self._sync_ai_players(memory, room_state)
+            self._sync_current_topic(memory, room_state)
             if room_state.get("status") != "CHATTING":
                 memory.pending_speeches.pop(ai_player_id, None)
                 logger.info("丢弃待发送发言：房间=%s，AI玩家=%s，当前状态=%s，不是讨论阶段。", room_code, ai_player_id, room_state.get("status"))
@@ -247,6 +264,7 @@ class AgentRuntime:
                 messages=messages,
                 original_message=task.original_message,
                 new_messages=new_messages,
+                current_topic=memory.current_topic,
             )
             decision = await review(context)
 
@@ -297,6 +315,7 @@ class AgentRuntime:
         try:
             room_state = await self._java_client.get_room_state(room_code)
             self._sync_ai_players(memory, room_state)
+            self._sync_current_topic(memory, room_state)
             if room_state.get("status") != "VOTING":
                 logger.info("投票暂不处理：触发=%s，房间=%s，当前状态=%s，不是投票阶段。", trigger, room_code, room_state.get("status"))
                 return
@@ -344,6 +363,7 @@ class AgentRuntime:
                 ai_player_id=ai_player_id,
                 room_state=room_state,
                 messages=messages_response.get("messages", []),
+                current_topic=memory.current_topic,
                 candidate_player_ids=candidates,
             )
             decision = await self._decision_engine.decide_vote(context)
@@ -373,6 +393,10 @@ class AgentRuntime:
             if player.get("type") == "AI":
                 memory.ai_player_ids.add(str(player.get("playerId")))
 
+    def _sync_current_topic(self, memory: RoomMemory, room_state: dict[str, Any]) -> None:
+        if "topic" in room_state:
+            memory.current_topic = _topic_from_payload(room_state.get("topic"))
+
     def _alive_ai_player_ids(self, room_state: dict[str, Any], memory: RoomMemory) -> list[str]:
         player_ids = []
         for player in room_state.get("players", []):
@@ -401,8 +425,11 @@ class AgentRuntime:
             await self._idle_speak(room_code)
 
     async def _idle_speak(self, room_code: str) -> None:
+        memory = self.room_memory(room_code)
         try:
             room_state = await self._java_client.get_room_state(room_code)
+            self._sync_ai_players(memory, room_state)
+            self._sync_current_topic(memory, room_state)
             if room_state.get("status") != "CHATTING":
                 logger.info("空闲检查暂不发言：房间=%s，当前状态=%s，不是讨论阶段。", room_code, room_state.get("status"))
                 return
@@ -411,8 +438,6 @@ class AgentRuntime:
             logger.warning("空闲检查失败：房间=%s，无法从 Java 查询状态或消息，错误=%s。", room_code, exc)
             return
 
-        memory = self.room_memory(room_code)
-        self._sync_ai_players(memory, room_state)
         messages = messages_response.get("messages", [])
         for ai_player_id in self._alive_ai_player_ids(room_state, memory):
             if ai_player_id in memory.pending_speeches:
@@ -422,6 +447,7 @@ class AgentRuntime:
                 ai_player_id=ai_player_id,
                 room_state=room_state,
                 messages=messages,
+                current_topic=memory.current_topic,
             )
             decision = await self._decision_engine.decide_speech(context)
             message = (decision.message or "").strip()
@@ -453,3 +479,19 @@ def _short_text(text: str, limit: int = 80) -> str:
     if len(compact) <= limit:
         return compact
     return compact[: limit - 3] + "..."
+
+
+def _topic_from_payload(value: Any) -> Topic | None:
+    if value is None:
+        return None
+    try:
+        return Topic.model_validate(value)
+    except (TypeError, ValueError, ValidationError) as exc:
+        logger.warning("忽略无法解析的话题字段：错误=%s，原始值=%s。", exc, value)
+        return None
+
+
+def _topic_text(topic: Topic | None) -> str:
+    if topic is None:
+        return "无"
+    return topic.content

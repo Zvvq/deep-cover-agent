@@ -2,7 +2,7 @@ import pytest
 
 from deep_cover_agent.config import Settings
 from deep_cover_agent.decision import PendingSpeechDecision, SpeechDecision, VoteDecision
-from deep_cover_agent.models import AgentEvent, AgentEventType
+from deep_cover_agent.models import AgentEvent, AgentEventType, Topic
 from deep_cover_agent.runtime import AgentRuntime
 
 
@@ -117,6 +117,45 @@ async def test_room_started_tracks_ai_players() -> None:
 
 
 @pytest.mark.asyncio
+async def test_room_started_and_round_started_track_current_topic() -> None:
+    runtime = AgentRuntime(FakeJavaClient(), ScriptedDecisionEngine(), immediate_settings())
+
+    await runtime.handle_event(
+        "ABC123",
+        event(
+            "event-1",
+            AgentEventType.ROOM_STARTED,
+            {
+                "roomCode": "ABC123",
+                "topic": {"id": "topic-001", "content": "聊聊最近看的电影"},
+                "aiPlayerIds": ["ai-1"],
+            },
+        ),
+    )
+    assert runtime.room_memory("ABC123").current_topic == Topic(
+        id="topic-001",
+        content="聊聊最近看的电影",
+    )
+
+    await runtime.handle_event(
+        "ABC123",
+        event(
+            "event-2",
+            AgentEventType.ROUND_STARTED,
+            {
+                "roundNumber": 2,
+                "topic": {"id": "topic-002", "content": "聊聊最近一次旅行"},
+            },
+        ),
+    )
+
+    assert runtime.room_memory("ABC123").current_topic == Topic(
+        id="topic-002",
+        content="聊聊最近一次旅行",
+    )
+
+
+@pytest.mark.asyncio
 async def test_human_chat_event_can_trigger_ai_message_once() -> None:
     java_client = FakeJavaClient()
     runtime = AgentRuntime(java_client, ScriptedDecisionEngine(), immediate_settings())
@@ -139,6 +178,37 @@ async def test_human_chat_event_can_trigger_ai_message_once() -> None:
     await runtime.handle_event("ABC123", chat_event)
 
     assert java_client.sent_messages == [("ABC123", "ai-1", "That sounds familiar to me.")]
+
+
+@pytest.mark.asyncio
+async def test_chat_decision_context_syncs_topic_from_room_state() -> None:
+    java_client = FakeJavaClient()
+    java_client.room_state["topic"] = {"id": "topic-003", "content": "聊聊最喜欢的城市"}
+    decision_engine = ScriptedDecisionEngine()
+    runtime = AgentRuntime(java_client, decision_engine, immediate_settings())
+    await runtime.handle_event(
+        "ABC123",
+        event("event-1", AgentEventType.ROOM_STARTED, {"roomCode": "ABC123", "aiPlayerIds": ["ai-1"]}),
+    )
+
+    await runtime.handle_event(
+        "ABC123",
+        event(
+            "event-2",
+            AgentEventType.CHAT_MESSAGE,
+            {
+                "messageId": "message-1",
+                "senderPlayerId": "human-1",
+                "content": "I went hiking last weekend.",
+                "createdAt": "2026-05-18T01:00:00Z",
+            },
+        ),
+    )
+
+    assert decision_engine.speech_calls[0].current_topic == Topic(
+        id="topic-003",
+        content="聊聊最喜欢的城市",
+    )
 
 
 @pytest.mark.asyncio

@@ -10,6 +10,7 @@ from deep_cover_agent.decision import (
     build_vote_prompt,
     parse_json_object,
 )
+from deep_cover_agent.models import Topic
 
 
 def test_parse_json_object_accepts_fenced_model_output() -> None:
@@ -31,6 +32,7 @@ def test_langchain_prompts_are_written_in_chinese() -> None:
         ai_player_id="ai-1",
         room_state={"status": "CHATTING"},
         messages=[],
+        current_topic=Topic(id="topic-001", content="聊聊周末计划"),
         candidate_player_ids=["human-1"],
     )
 
@@ -41,6 +43,8 @@ def test_langchain_prompts_are_written_in_chinese() -> None:
     assert "你是 Deep Cover 游戏中的 AI 玩家" in system_prompt
     assert "只读查询工具" in system_prompt
     assert "是否应该发言" in speech_prompt
+    assert "当前话题：聊聊周末计划" in speech_prompt
+    assert "请围绕当前话题自然发言" in speech_prompt
     assert "只返回 JSON" in speech_prompt
     assert "投票目标" in vote_prompt
     assert "不能选择自己" in vote_prompt

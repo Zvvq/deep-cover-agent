@@ -7,6 +7,7 @@ from dataclasses import dataclass, field
 from typing import Any, Protocol
 
 from .config import Settings
+from .models import Topic
 from .tools import build_agent_query_tools
 
 
@@ -16,6 +17,7 @@ class DecisionContext:
     ai_player_id: str
     room_state: dict[str, Any]
     messages: list[dict[str, Any]]
+    current_topic: Topic | None = None
     candidate_player_ids: list[str] = field(default_factory=list)
 
 
@@ -27,6 +29,7 @@ class PendingSpeechContext:
     messages: list[dict[str, Any]]
     original_message: str
     new_messages: list[dict[str, Any]] = field(default_factory=list)
+    current_topic: Topic | None = None
 
 
 @dataclass(frozen=True)
@@ -132,6 +135,7 @@ def build_speech_prompt(context: DecisionContext) -> str:
     return (
         "请判断当前 AI 玩家是否应该发言。\n"
         '只返回 JSON：{"shouldSpeak": boolean, "message": string|null}。\n'
+        f"{_topic_instruction(context.current_topic)}"
         "如果当前没有自然接话点、刚刚已经有 AI 发言，或者发言会显得突兀，就选择不发言。"
         "如果发言，要保持像真人玩家一样自然，不要暴露 AI 身份。\n"
         f"上下文：\n{json.dumps(_jsonable_context(context), ensure_ascii=False)}"
@@ -154,6 +158,7 @@ def build_pending_speech_review_prompt(context: PendingSpeechContext) -> str:
         "请判断这条旧发言是否还适合发送。\n"
         '只返回 JSON：{"action":"send_original|send_revised|discard|wait","message":string|null,"reason":string,"extraDelaySeconds":number}。\n'
         "send_original 表示发送原草稿；send_revised 表示发送修改后的 message；discard 表示丢弃不发；wait 表示再等一小会儿。\n"
+        f"{_topic_instruction(context.current_topic)}"
         "如果修改发言，message 必须像真人玩家一样自然、简短、口语化，不要暴露 AI 身份，且不超过 300 个字符。\n"
         f"上下文：\n{json.dumps(_jsonable_pending_speech_context(context), ensure_ascii=False)}"
     )
@@ -254,6 +259,7 @@ def _jsonable_context(context: DecisionContext) -> dict[str, Any]:
     return {
         "roomCode": context.room_code,
         "aiPlayerId": context.ai_player_id,
+        "currentTopic": _jsonable_topic(context.current_topic),
         "roomState": context.room_state,
         "messages": context.messages[-20:],
         "candidatePlayerIds": context.candidate_player_ids,
@@ -264,11 +270,27 @@ def _jsonable_pending_speech_context(context: PendingSpeechContext) -> dict[str,
     return {
         "roomCode": context.room_code,
         "aiPlayerId": context.ai_player_id,
+        "currentTopic": _jsonable_topic(context.current_topic),
         "roomState": context.room_state,
         "messages": context.messages[-20:],
         "originalMessage": context.original_message,
         "newMessages": context.new_messages[-10:],
     }
+
+
+def _topic_instruction(topic: Topic | None) -> str:
+    if topic is None or not topic.content.strip():
+        return ""
+    return (
+        f"当前话题：{topic.content.strip()}\n"
+        "请围绕当前话题自然发言，不要偏离话题太远，也不要暴露自己是 AI。\n"
+    )
+
+
+def _jsonable_topic(topic: Topic | None) -> dict[str, str] | None:
+    if topic is None:
+        return None
+    return topic.model_dump()
 
 
 def _extract_message_text(result: Any) -> str:

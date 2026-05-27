@@ -62,12 +62,18 @@ class AgentPlayerView(JavaModel):
     host: bool
 
 
+class Topic(JavaModel):
+    id: str
+    content: str
+
+
 class AgentRoomStateResponse(JavaModel):
     room_code: str = Field(alias="roomCode")
     status: str
     round_number: int = Field(alias="roundNumber")
     alive_human_count: int = Field(alias="aliveHumanCount")
     alive_ai_count: int = Field(alias="aliveAiCount")
+    topic: Topic | None = None
     players: list[AgentPlayerView] = Field(default_factory=list)
 
 
