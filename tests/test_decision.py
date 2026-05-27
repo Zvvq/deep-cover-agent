@@ -54,6 +54,8 @@ def test_langchain_prompts_are_written_in_chinese() -> None:
     assert "当前话题：聊聊周末计划" in speech_prompt
     assert "请围绕当前话题自然发言" in speech_prompt
     assert "不要为了贴合当前话题硬拉回话题" in speech_prompt
+    assert '"messages": string[]' in speech_prompt
+    assert "最多 3 段" in speech_prompt
     assert "只返回 JSON" in speech_prompt
     assert "投票目标" in vote_prompt
     assert "不能选择自己" in vote_prompt
@@ -66,6 +68,8 @@ def test_pending_speech_review_prompt_prioritizes_latest_messages() -> None:
         room_state={"status": "CHATTING"},
         messages=[],
         original_message="如果只能吃一种主食，那我选米饭。",
+        sent_messages=["如果只能吃一种主食"],
+        remaining_messages=["那我选米饭。"],
         new_messages=[{"senderPlayerId": "human-1", "content": "你们投的谁？"}],
         current_topic=Topic(id="topic-001", content="如果今晚只能吃一种主食，你会选什么？"),
     )
@@ -74,6 +78,7 @@ def test_pending_speech_review_prompt_prioritizes_latest_messages() -> None:
 
     assert "优先根据最新消息判断" in prompt
     assert "不要为了贴合当前话题硬拉回话题" in prompt
+    assert "remainingMessages" in prompt
 
 
 def test_langchain_deepseek_disables_thinking_mode_by_default(monkeypatch) -> None:
@@ -113,6 +118,8 @@ async def test_langchain_pending_speech_review_failure_discards_stale_draft() ->
         room_state={"status": "CHATTING"},
         messages=[],
         original_message="如果只能吃一种主食，那我选米饭。",
+        sent_messages=["如果只能吃一种主食"],
+        remaining_messages=["那我选米饭。"],
         new_messages=[{"senderPlayerId": "human-1", "content": "你们投的谁？"}],
         current_topic=Topic(id="topic-001", content="如果今晚只能吃一种主食，你会选什么？"),
     )
@@ -121,6 +128,31 @@ async def test_langchain_pending_speech_review_failure_discards_stale_draft() ->
 
     assert decision.action == "discard"
     assert "复核失败" in decision.reason
+
+
+@pytest.mark.asyncio
+async def test_langchain_speech_decision_accepts_segmented_messages() -> None:
+    class SegmentedSpeechEngine(LangChainDeepSeekDecisionEngine):
+        def __init__(self) -> None:
+            self._fallback = RuleBasedDecisionEngine()
+
+        async def _invoke(self, prompt: str) -> str:
+            return '{"shouldSpeak": true, "messages": ["观察力吧", "感觉能少踩坑"]}'
+
+    engine = SegmentedSpeechEngine()
+
+    decision = await engine.decide_speech(
+        DecisionContext(
+            room_code="ABC123",
+            ai_player_id="ai-1",
+            room_state={"status": "CHATTING"},
+            messages=[],
+        )
+    )
+
+    assert decision.should_speak is True
+    assert decision.messages == ("观察力吧", "感觉能少踩坑")
+    assert decision.message == "观察力吧"
 
 
 @pytest.mark.asyncio

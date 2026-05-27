@@ -76,11 +76,12 @@ class ScriptedDecisionEngine:
         self.speech_calls = []
         self.vote_calls = []
         self.pending_speech_reviews = []
+        self.speech_decision = SpeechDecision(should_speak=True, message="That sounds familiar to me.")
         self.pending_speech_decision = PendingSpeechDecision(action="send_original")
 
     async def decide_speech(self, context):
         self.speech_calls.append(context)
-        return SpeechDecision(should_speak=True, message="That sounds familiar to me.")
+        return self.speech_decision
 
     async def decide_vote(self, context):
         self.vote_calls.append(context)
@@ -409,6 +410,129 @@ async def test_pending_speech_with_new_human_message_is_reviewed_before_send() -
     assert java_client.sent_messages == [("ABC123", "ai-1", "I was going to say that too.")]
     assert len(decision_engine.pending_speech_reviews) == 1
     assert decision_engine.pending_speech_reviews[0].original_message == "That sounds familiar to me."
+
+
+@pytest.mark.asyncio
+async def test_segmented_speech_plan_sends_one_part_at_a_time() -> None:
+    java_client = FakeJavaClient()
+    decision_engine = ScriptedDecisionEngine()
+    decision_engine.speech_decision = SpeechDecision(
+        should_speak=True,
+        messages=("观察力吧", "感觉能少踩坑"),
+    )
+    runtime = AgentRuntime(
+        java_client,
+        decision_engine,
+        Settings(speech_base_delay_seconds=60, speech_typing_seconds_per_char=0, speech_max_delay_seconds=60),
+    )
+    await runtime.handle_event(
+        "ABC123",
+        event("event-1", AgentEventType.ROOM_STARTED, {"roomCode": "ABC123", "aiPlayerIds": ["ai-1"]}),
+    )
+    await runtime.handle_event(
+        "ABC123",
+        event(
+            "event-2",
+            AgentEventType.CHAT_MESSAGE,
+            {
+                "messageId": "message-1",
+                "senderPlayerId": "human-1",
+                "content": "Would you pick memory or observation?",
+                "createdAt": "2026-05-18T01:00:00Z",
+            },
+        ),
+    )
+
+    pending = runtime.room_memory("ABC123").pending_speeches["ai-1"]
+    pending.due_at = 0
+    await runtime.run_pending_speech_checks()
+
+    assert java_client.sent_messages == [("ABC123", "ai-1", "观察力吧")]
+    assert "ai-1" in runtime.room_memory("ABC123").pending_speeches
+
+    pending = runtime.room_memory("ABC123").pending_speeches["ai-1"]
+    pending.due_at = 0
+    await runtime.run_pending_speech_checks()
+
+    assert java_client.sent_messages == [
+        ("ABC123", "ai-1", "观察力吧"),
+        ("ABC123", "ai-1", "感觉能少踩坑"),
+    ]
+    assert runtime.room_memory("ABC123").pending_speeches == {}
+
+
+@pytest.mark.asyncio
+async def test_segmented_remaining_speech_is_reviewed_without_restart_delay() -> None:
+    java_client = FakeJavaClient()
+    decision_engine = ScriptedDecisionEngine()
+    decision_engine.speech_decision = SpeechDecision(
+        should_speak=True,
+        messages=("观察力吧", "感觉能少踩坑"),
+    )
+    decision_engine.pending_speech_decision = PendingSpeechDecision(action="continue")
+    runtime = AgentRuntime(
+        java_client,
+        decision_engine,
+        Settings(
+            speech_base_delay_seconds=10,
+            speech_typing_seconds_per_char=0,
+            speech_max_delay_seconds=10,
+            speech_context_reaction_delay_seconds=2,
+        ),
+    )
+    await runtime.handle_event(
+        "ABC123",
+        event("event-1", AgentEventType.ROOM_STARTED, {"roomCode": "ABC123", "aiPlayerIds": ["ai-1"]}),
+    )
+    await runtime.handle_event(
+        "ABC123",
+        event(
+            "event-2",
+            AgentEventType.CHAT_MESSAGE,
+            {
+                "messageId": "message-1",
+                "senderPlayerId": "human-1",
+                "content": "Would you pick memory or observation?",
+                "createdAt": "2026-05-18T01:00:00Z",
+            },
+        ),
+    )
+    pending = runtime.room_memory("ABC123").pending_speeches["ai-1"]
+    pending.due_at = 0
+    await runtime.run_pending_speech_checks()
+
+    assert java_client.sent_messages == [("ABC123", "ai-1", "观察力吧")]
+    pending = runtime.room_memory("ABC123").pending_speeches["ai-1"]
+    pending.due_at = pending.due_at - 5
+    java_client.messages["messages"].append(
+        {
+            "messageId": "message-2",
+            "senderPlayerId": "human-2",
+            "content": "Memory can be trained too.",
+            "createdAt": "2026-05-18T01:00:05Z",
+        }
+    )
+
+    await runtime.handle_event(
+        "ABC123",
+        event(
+            "event-3",
+            AgentEventType.CHAT_MESSAGE,
+            {
+                "messageId": "message-2",
+                "senderPlayerId": "human-2",
+                "content": "Memory can be trained too.",
+                "createdAt": "2026-05-18T01:00:05Z",
+            },
+        ),
+    )
+
+    pending = runtime.room_memory("ABC123").pending_speeches["ai-1"]
+    remaining_delay = pending.due_at - runtime._now()
+    assert len(decision_engine.pending_speech_reviews) == 1
+    assert decision_engine.pending_speech_reviews[0].sent_messages == ["观察力吧"]
+    assert decision_engine.pending_speech_reviews[0].remaining_messages == ["感觉能少踩坑"]
+    assert 4.0 <= remaining_delay <= 6.0
 
 
 @pytest.mark.asyncio
