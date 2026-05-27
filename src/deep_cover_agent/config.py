@@ -20,6 +20,7 @@ class Settings(BaseSettings):
     deepseek_temperature: float = 0.7
     deepseek_max_retries: int = 2
     deepseek_timeout_seconds: float = 30.0
+    deepseek_thinking_enabled: bool = False
 
     enable_langchain: bool = True
     idle_check_interval_seconds: float = 5.0
