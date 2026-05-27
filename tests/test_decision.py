@@ -1,5 +1,10 @@
+import sys
+import logging
+from types import SimpleNamespace
+
 import pytest
 
+from deep_cover_agent.config import Settings
 from deep_cover_agent.decision import (
     DecisionContext,
     LangChainDeepSeekDecisionEngine,
@@ -71,6 +76,27 @@ def test_pending_speech_review_prompt_prioritizes_latest_messages() -> None:
     assert "不要为了贴合当前话题硬拉回话题" in prompt
 
 
+def test_langchain_deepseek_disables_thinking_mode_by_default(monkeypatch) -> None:
+    captured = {}
+
+    class FakeChatDeepSeek:
+        def __init__(self, **kwargs):
+            captured["model_kwargs"] = kwargs
+
+    def fake_create_agent(model, tools, system_prompt):
+        captured["agent_model"] = model
+        captured["tools"] = tools
+        captured["system_prompt"] = system_prompt
+        return object()
+
+    monkeypatch.setitem(sys.modules, "langchain.agents", SimpleNamespace(create_agent=fake_create_agent))
+    monkeypatch.setitem(sys.modules, "langchain_deepseek", SimpleNamespace(ChatDeepSeek=FakeChatDeepSeek))
+
+    LangChainDeepSeekDecisionEngine(Settings(deepseek_api_key="test-key"))
+
+    assert captured["model_kwargs"]["extra_body"] == {"thinking": {"type": "disabled"}}
+
+
 @pytest.mark.asyncio
 async def test_langchain_pending_speech_review_failure_discards_stale_draft() -> None:
     class BrokenReviewEngine(LangChainDeepSeekDecisionEngine):
@@ -95,6 +121,32 @@ async def test_langchain_pending_speech_review_failure_discards_stale_draft() ->
 
     assert decision.action == "discard"
     assert "复核失败" in decision.reason
+
+
+@pytest.mark.asyncio
+async def test_langchain_failures_log_summary_without_traceback(caplog) -> None:
+    class BrokenSpeechEngine(LangChainDeepSeekDecisionEngine):
+        def __init__(self) -> None:
+            self._fallback = RuleBasedDecisionEngine()
+
+        async def _invoke(self, prompt: str) -> str:
+            raise RuntimeError("model failed")
+
+    caplog.set_level(logging.WARNING, logger="uvicorn.error")
+    engine = BrokenSpeechEngine()
+
+    await engine.decide_speech(
+        DecisionContext(
+            room_code="ABC123",
+            ai_player_id="ai-1",
+            room_state={"status": "CHATTING"},
+            messages=[],
+        )
+    )
+
+    model_records = [record for record in caplog.records if "[模型]" in record.getMessage()]
+    assert model_records
+    assert all(record.exc_info is None for record in model_records)
 
 
 @pytest.mark.asyncio

@@ -86,8 +86,8 @@ def test_accepts_event_logs_chinese_business_messages(caplog) -> None:
 
     assert response.status_code == 202
     messages = [record.getMessage() for record in caplog.records]
-    assert any("收到 Java 事件" in message and "房间=ABC123" in message for message in messages)
-    assert any("事件处理完成" in message and "事件ID=event-1" in message for message in messages)
+    assert any("[事件]" in message and "room=ABC123" in message and "type=ROOM_STARTED" in message for message in messages)
+    assert not any("payload=" in message for message in messages)
 
 
 def test_accepts_event_with_jackson_array_timestamp() -> None:
