@@ -67,9 +67,9 @@ POST /api/internal/agent/rooms/{roomCode}/votes
 
 ## 发言延迟
 
-Agent 生成聊天回复后不会立刻提交给 Java，而是按消息长度模拟打字等待。等待结束后会重新查询 Java 房间状态；如果已经不是讨论阶段、AI 已死亡或房间结束，这条草稿会被丢弃。
+Agent 生成聊天回复后不会立刻提交给 Java，而是按消息长度模拟打字等待。Agent 可以返回 1-3 段短消息，Runtime 会逐段提交。每段发送前都会重新查询 Java 房间状态；如果已经不是讨论阶段、AI 已死亡或房间结束，剩余草稿会被丢弃。
 
-如果等待期间有新的真人消息进入，Agent 会在发送前复核旧草稿，决定发送原文、改写后发送、丢弃，或再等待一小段时间。
+如果等待期间有新的真人消息进入，Agent 会复核剩余草稿，决定继续发送、改写剩余段、丢弃，或再等待一小段时间。复核后如果继续发送，会保留已经过去的打字等待时间，只补一个短反应延迟。
 
 可通过 `.env` 调整：
 
@@ -78,5 +78,8 @@ DEEP_COVER_AGENT_SPEECH_BASE_DELAY_SECONDS=2
 DEEP_COVER_AGENT_SPEECH_TYPING_SECONDS_PER_CHAR=1
 DEEP_COVER_AGENT_SPEECH_MAX_DELAY_SECONDS=45
 DEEP_COVER_AGENT_SPEECH_RETRY_DELAY_SECONDS=3
+DEEP_COVER_AGENT_SPEECH_CONTEXT_REACTION_DELAY_SECONDS=2
+DEEP_COVER_AGENT_SPEECH_REVISION_EXTRA_DELAY_SECONDS=4
+DEEP_COVER_AGENT_SPEECH_MAX_SEGMENTS=3
 DEEP_COVER_AGENT_PENDING_SPEECH_MAX_REVIEWS=2
 ```
