@@ -13,10 +13,12 @@ conda create -y -p .conda python=3.11 pip
 
 复制 `.env.example` 为 `.env`，并设置 `DEEP_COVER_AGENT_DEEPSEEK_API_KEY` 以启用 DeepSeek 决策。没有配置 API Key 时，运行时会使用确定性的兜底决策引擎。
 
+默认会通过 `DEEP_COVER_AGENT_DEEPSEEK_THINKING_ENABLED=false` 禁用 DeepSeek thinking mode，避免 LangChain 工具调用循环与 DeepSeek 的 `reasoning_content` 续传要求冲突。
+
 ## 启动
 
 ```powershell
-.\.conda\python.exe -m uvicorn deep_cover_agent.api:app --host 0.0.0.0 --port 8000
+.\.conda\python.exe -m uvicorn deep_cover_agent.api:app --host 0.0.0.0 --port 8000 --no-access-log
 ```
 
 健康检查：
