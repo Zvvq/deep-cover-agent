@@ -1,3 +1,5 @@
+import asyncio
+
 import pytest
 
 from deep_cover_agent.config import Settings
@@ -61,6 +63,12 @@ class FakeJavaClient:
             raise RuntimeError("temporary vote submit failure")
         self.cast_votes.append((room_code, ai_player_id, target_player_id, reason))
         return {"roomCode": room_code, "roundNumber": 1, "settled": False}
+
+
+class SlowSendJavaClient(FakeJavaClient):
+    async def send_message(self, room_code: str, ai_player_id: str, content: str):
+        await asyncio.sleep(0.01)
+        return await super().send_message(room_code, ai_player_id, content)
 
 
 class ScriptedDecisionEngine:
@@ -401,6 +409,39 @@ async def test_pending_speech_with_new_human_message_is_reviewed_before_send() -
     assert java_client.sent_messages == [("ABC123", "ai-1", "I was going to say that too.")]
     assert len(decision_engine.pending_speech_reviews) == 1
     assert decision_engine.pending_speech_reviews[0].original_message == "That sounds familiar to me."
+
+
+@pytest.mark.asyncio
+async def test_concurrent_pending_speech_checks_submit_same_draft_once() -> None:
+    java_client = SlowSendJavaClient()
+    runtime = AgentRuntime(
+        java_client,
+        ScriptedDecisionEngine(),
+        Settings(speech_base_delay_seconds=60, speech_typing_seconds_per_char=0, speech_max_delay_seconds=60),
+    )
+    await runtime.handle_event(
+        "ABC123",
+        event("event-1", AgentEventType.ROOM_STARTED, {"roomCode": "ABC123", "aiPlayerIds": ["ai-1"]}),
+    )
+    await runtime.handle_event(
+        "ABC123",
+        event(
+            "event-2",
+            AgentEventType.CHAT_MESSAGE,
+            {
+                "messageId": "message-1",
+                "senderPlayerId": "human-1",
+                "content": "I went hiking last weekend.",
+                "createdAt": "2026-05-18T01:00:00Z",
+            },
+        ),
+    )
+    pending = runtime.room_memory("ABC123").pending_speeches["ai-1"]
+    pending.due_at = 0
+
+    await asyncio.gather(runtime.run_pending_speech_checks(), runtime.run_pending_speech_checks())
+
+    assert java_client.sent_messages == [("ABC123", "ai-1", "That sounds familiar to me.")]
 
 
 @pytest.mark.asyncio

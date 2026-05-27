@@ -3,12 +3,16 @@ from __future__ import annotations
 import asyncio
 import inspect
 import json
+import logging
 from dataclasses import dataclass, field
 from typing import Any, Protocol
 
 from .config import Settings
 from .models import Topic
 from .tools import build_agent_query_tools
+
+
+logger = logging.getLogger("uvicorn.error")
 
 
 @dataclass(frozen=True)
@@ -155,7 +159,7 @@ def build_vote_prompt(context: DecisionContext) -> str:
 def build_pending_speech_review_prompt(context: PendingSpeechContext) -> str:
     return (
         "你之前已经为当前 AI 玩家写好了一条待发送发言，但在模拟打字等待期间，聊天上下文发生了变化。\n"
-        "请判断这条旧发言是否还适合发送。\n"
+        "请判断这条旧发言是否还适合发送，优先根据最新消息判断。\n"
         '只返回 JSON：{"action":"send_original|send_revised|discard|wait","message":string|null,"reason":string,"extraDelaySeconds":number}。\n'
         "send_original 表示发送原草稿；send_revised 表示发送修改后的 message；discard 表示丢弃不发；wait 表示再等一小会儿。\n"
         f"{_topic_instruction(context.current_topic)}"
@@ -198,6 +202,7 @@ class LangChainDeepSeekDecisionEngine:
                 return SpeechDecision(should_speak=False)
             return SpeechDecision(should_speak=True, message=message.strip()[:300])
         except Exception:
+            logger.warning("AI 发言决策失败，改为保持沉默。", exc_info=True)
             return await self._fallback.decide_speech(context)
 
     async def review_pending_speech(self, context: PendingSpeechContext) -> PendingSpeechDecision:
@@ -206,7 +211,8 @@ class LangChainDeepSeekDecisionEngine:
             data = parse_json_object(await self._invoke(prompt))
             action = data.get("action")
             if action not in {"send_original", "send_revised", "discard", "wait"}:
-                return await self._fallback.review_pending_speech(context)
+                logger.warning("待发送发言复核返回了非法动作，已丢弃旧草稿：action=%s。", action)
+                return PendingSpeechDecision(action="discard", reason="复核返回非法动作，已丢弃旧草稿。")
             message = data.get("message")
             if action == "send_original":
                 return PendingSpeechDecision(
@@ -216,7 +222,8 @@ class LangChainDeepSeekDecisionEngine:
                 )
             if action == "send_revised":
                 if not isinstance(message, str) or not message.strip():
-                    return await self._fallback.review_pending_speech(context)
+                    logger.warning("待发送发言复核要求改写，但 message 为空，已丢弃旧草稿。")
+                    return PendingSpeechDecision(action="discard", reason="复核改写内容为空，已丢弃旧草稿。")
                 return PendingSpeechDecision(
                     action="send_revised",
                     message=message.strip()[:300],
@@ -232,7 +239,8 @@ class LangChainDeepSeekDecisionEngine:
                 )
             return PendingSpeechDecision(action="discard", reason=str(data.get("reason") or ""))
         except Exception:
-            return await self._fallback.review_pending_speech(context)
+            logger.warning("待发送发言复核失败，已丢弃旧草稿，避免发送过期上下文。", exc_info=True)
+            return PendingSpeechDecision(action="discard", reason="复核失败，已丢弃旧草稿。")
 
     async def decide_vote(self, context: DecisionContext) -> VoteDecision:
         prompt = build_vote_prompt(context)
@@ -244,6 +252,7 @@ class LangChainDeepSeekDecisionEngine:
                 return VoteDecision(target_player_id=target, reason=reason)
             return await self._fallback.decide_vote(context)
         except Exception:
+            logger.warning("AI 投票决策失败，使用兜底投票策略。", exc_info=True)
             return await self._fallback.decide_vote(context)
 
     async def _invoke(self, prompt: str) -> str:
@@ -283,7 +292,7 @@ def _topic_instruction(topic: Topic | None) -> str:
         return ""
     return (
         f"当前话题：{topic.content.strip()}\n"
-        "请围绕当前话题自然发言，不要偏离话题太远，也不要暴露自己是 AI。\n"
+        "请围绕当前话题自然发言，但要优先接住最新聊天上下文，不要为了贴合当前话题硬拉回话题，也不要暴露自己是 AI。\n"
     )
 
 

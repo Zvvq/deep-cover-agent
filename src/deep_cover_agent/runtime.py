@@ -33,6 +33,7 @@ class PendingSpeechTask:
     due_at: float
     context_changed: bool = False
     review_count: int = 0
+    processing: bool = False
 
 
 @dataclass
@@ -219,9 +220,14 @@ class AgentRuntime:
         now = monotonic()
         for room_code, memory in list(self._rooms.items()):
             for ai_player_id, task in list(memory.pending_speeches.items()):
-                if task.due_at > now:
+                if task.processing or task.due_at > now:
                     continue
-                await self._process_pending_speech(room_code, memory, ai_player_id, task, now)
+                task.processing = True
+                try:
+                    await self._process_pending_speech(room_code, memory, ai_player_id, task, now)
+                finally:
+                    if memory.pending_speeches.get(ai_player_id) is task:
+                        task.processing = False
 
     async def _process_pending_speech(
         self,
@@ -231,6 +237,9 @@ class AgentRuntime:
         task: PendingSpeechTask,
         now: float,
     ) -> None:
+        if memory.pending_speeches.get(ai_player_id) is not task:
+            logger.info("跳过已被替换的待发送发言：房间=%s，AI玩家=%s。", room_code, ai_player_id)
+            return
         try:
             room_state = await self._java_client.get_room_state(room_code)
             self._sync_ai_players(memory, room_state)
