@@ -31,6 +31,9 @@ class Settings(BaseSettings):
     speech_typing_seconds_per_char: float = 0.5
     speech_max_delay_seconds: float = 30.0
     speech_retry_delay_seconds: float = 3.0
+    speech_context_reaction_delay_seconds: float = 2.0
+    speech_revision_extra_delay_seconds: float = 4.0
+    speech_max_segments: int = 3
     pending_speech_max_reviews: int = 2
 
 
