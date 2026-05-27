@@ -17,6 +17,7 @@ from .decision import (
     PendingSpeechContext,
     PendingSpeechDecision,
     RuleBasedDecisionEngine,
+    SpeechDecision,
 )
 from .java_client import JavaAgentClient
 from .models import AgentEvent, AgentEventType, Topic
@@ -28,12 +29,26 @@ logger = logging.getLogger("uvicorn.error")
 @dataclass
 class PendingSpeechTask:
     ai_player_id: str
-    original_message: str
+    messages: list[str]
     created_after_message_id: str | None
     due_at: float
+    next_message_index: int = 0
+    sent_messages: list[str] = field(default_factory=list)
     context_changed: bool = False
+    review_requested: bool = False
     review_count: int = 0
     processing: bool = False
+
+    @property
+    def original_message(self) -> str:
+        return "\n".join(self.messages)
+
+    def remaining_messages(self) -> list[str]:
+        return self.messages[self.next_message_index :]
+
+    def current_message(self) -> str | None:
+        remaining = self.remaining_messages()
+        return remaining[0] if remaining else None
 
 
 @dataclass
@@ -63,6 +78,9 @@ class AgentRuntime:
 
     def room_memory(self, room_code: str) -> RoomMemory:
         return self._rooms.setdefault(room_code, RoomMemory())
+
+    def _now(self) -> float:
+        return monotonic()
 
     async def start(self) -> None:
         if self._idle_task is None:
@@ -163,6 +181,7 @@ class AgentRuntime:
             pending = memory.pending_speeches.get(ai_player_id)
             if pending is not None:
                 pending.context_changed = True
+                pending.review_requested = True
                 logger.info(
                     "[发言] room=%s ai=%s draft=review_needed sender=%s",
                     room_code,
@@ -179,9 +198,9 @@ class AgentRuntime:
                 current_topic=memory.current_topic,
             )
             decision = await self._decision_engine.decide_speech(context)
-            message = (decision.message or "").strip()
-            if decision.should_speak and message:
-                await self._schedule_speech(room_code, memory, ai_player_id, message[:300], messages)
+            speech_parts = _decision_message_parts(decision, self._settings.speech_max_segments)
+            if decision.should_speak and speech_parts:
+                await self._schedule_speech(room_code, memory, ai_player_id, speech_parts, messages)
             else:
                 logger.debug("[发言] room=%s ai=%s decision=silent", room_code, _short_id(ai_player_id))
 
@@ -192,24 +211,26 @@ class AgentRuntime:
         room_code: str,
         memory: RoomMemory,
         ai_player_id: str,
-        message: str,
-        messages: list[dict[str, Any]],
+        speech_parts: list[str],
+        conversation_messages: list[dict[str, Any]],
     ) -> None:
-        delay_seconds = self._speech_delay_seconds(message)
+        first_part = speech_parts[0]
+        delay_seconds = self._speech_delay_seconds(first_part)
         task = PendingSpeechTask(
             ai_player_id=ai_player_id,
-            original_message=message,
-            created_after_message_id=_last_message_id(messages),
-            due_at=monotonic() + delay_seconds,
+            messages=speech_parts[: self._settings.speech_max_segments],
+            created_after_message_id=_last_message_id(conversation_messages),
+            due_at=self._now() + delay_seconds,
         )
         memory.pending_speeches[ai_player_id] = task
         logger.info(
-            "[发言] room=%s ai=%s draft delay=%.1fs chars=%s text=%s",
+            "[发言] room=%s ai=%s draft parts=%s delay=%.1fs chars=%s text=%s",
             room_code,
             _short_id(ai_player_id),
+            len(task.messages),
             delay_seconds,
-            len(message),
-            _short_text(message),
+            len(first_part),
+            _short_text(first_part),
         )
 
     def _speech_delay_seconds(self, message: str) -> float:
@@ -217,10 +238,12 @@ class AgentRuntime:
         return max(0.0, min(raw_delay, self._settings.speech_max_delay_seconds))
 
     async def run_pending_speech_checks(self) -> None:
-        now = monotonic()
+        now = self._now()
         for room_code, memory in list(self._rooms.items()):
             for ai_player_id, task in list(memory.pending_speeches.items()):
-                if task.processing or task.due_at > now:
+                if task.processing:
+                    continue
+                if not task.review_requested and task.due_at > now:
                     continue
                 task.processing = True
                 try:
@@ -259,41 +282,35 @@ class AgentRuntime:
             return
 
         messages = messages_response.get("messages", [])
-        new_messages = _messages_after(task.created_after_message_id, messages)
+        new_messages = _human_messages_after(task.created_after_message_id, messages, memory.ai_player_ids)
         context_changed = task.context_changed or bool(new_messages)
-        decision = PendingSpeechDecision(action="send_original", message=task.original_message)
         if context_changed:
             review = getattr(self._decision_engine, "review_pending_speech", None)
             if review is None:
                 review = RuleBasedDecisionEngine().review_pending_speech
+            original_remaining_delay = max(0.0, task.due_at - now)
             context = PendingSpeechContext(
                 room_code=room_code,
                 ai_player_id=ai_player_id,
                 room_state=room_state,
                 messages=messages,
                 original_message=task.original_message,
+                sent_messages=list(task.sent_messages),
+                remaining_messages=task.remaining_messages(),
                 new_messages=new_messages,
                 current_topic=memory.current_topic,
             )
             decision = await review(context)
-
-        action = decision.action
-        if action == "wait":
-            if task.review_count >= self._settings.pending_speech_max_reviews:
-                memory.pending_speeches.pop(ai_player_id, None)
-                logger.info("[发言] room=%s ai=%s discard=max_reviews", room_code, _short_id(ai_player_id))
+            task.created_after_message_id = _last_message_id(messages)
+            if self._apply_pending_speech_review(room_code, memory, ai_player_id, task, decision, now, original_remaining_delay):
                 return
-            task.review_count += 1
-            delay = decision.extra_delay_seconds if decision.extra_delay_seconds > 0 else self._settings.speech_retry_delay_seconds
-            task.due_at = now + min(delay, self._settings.speech_max_delay_seconds)
-            logger.info("[发言] room=%s ai=%s wait=%.1fs reason=%s", room_code, _short_id(ai_player_id), delay, _short_text(decision.reason))
-            return
-        if action == "discard":
-            memory.pending_speeches.pop(ai_player_id, None)
-            logger.info("[发言] room=%s ai=%s discard=review reason=%s", room_code, _short_id(ai_player_id), _short_text(decision.reason))
+            task.context_changed = False
+            task.review_requested = False
+
+        if task.due_at > now:
             return
 
-        message = task.original_message if action == "send_original" else (decision.message or "").strip()
+        message = task.current_message()
         if not message:
             memory.pending_speeches.pop(ai_player_id, None)
             logger.info("[发言] room=%s ai=%s discard=empty", room_code, _short_id(ai_player_id))
@@ -301,11 +318,96 @@ class AgentRuntime:
 
         try:
             await self._java_client.send_message(room_code, ai_player_id, message[:300])
-            memory.pending_speeches.pop(ai_player_id, None)
-            logger.info("[发言] room=%s ai=%s send action=%s text=%s", room_code, _short_id(ai_player_id), action, _short_text(message))
         except (httpx.HTTPError, RuntimeError) as exc:
             task.due_at = now + self._settings.speech_retry_delay_seconds
             logger.warning("[发言][错误] room=%s ai=%s stage=submit retry=%.1fs error=%s", room_code, _short_id(ai_player_id), self._settings.speech_retry_delay_seconds, _error_summary(exc))
+            return
+
+        task.sent_messages.append(message)
+        task.next_message_index += 1
+        task.context_changed = False
+        task.review_requested = False
+        task.review_count = 0
+        task.created_after_message_id = _last_message_id(messages)
+        if not task.remaining_messages():
+            memory.pending_speeches.pop(ai_player_id, None)
+            logger.info("[发言] room=%s ai=%s send done=true text=%s", room_code, _short_id(ai_player_id), _short_text(message))
+            return
+
+        next_message = task.current_message() or ""
+        delay = self._speech_delay_seconds(next_message)
+        task.due_at = self._now() + delay
+        logger.info("[发言] room=%s ai=%s send next_delay=%.1fs text=%s", room_code, _short_id(ai_player_id), delay, _short_text(message))
+
+    def _apply_pending_speech_review(
+        self,
+        room_code: str,
+        memory: RoomMemory,
+        ai_player_id: str,
+        task: PendingSpeechTask,
+        decision: PendingSpeechDecision,
+        now: float,
+        original_remaining_delay: float,
+    ) -> bool:
+        action = decision.action
+        if action == "send_original":
+            action = "continue"
+        elif action == "send_revised":
+            action = "revise"
+
+        if action == "wait":
+            if task.review_count >= self._settings.pending_speech_max_reviews:
+                memory.pending_speeches.pop(ai_player_id, None)
+                logger.info("[发言] room=%s ai=%s discard=max_reviews", room_code, _short_id(ai_player_id))
+                return True
+            task.review_count += 1
+            delay = decision.extra_delay_seconds if decision.extra_delay_seconds > 0 else self._settings.speech_retry_delay_seconds
+            task.due_at = now + min(delay, self._settings.speech_max_delay_seconds)
+            task.context_changed = False
+            task.review_requested = False
+            logger.info("[发言] room=%s ai=%s wait=%.1fs reason=%s", room_code, _short_id(ai_player_id), delay, _short_text(decision.reason))
+            return True
+
+        if action == "discard":
+            memory.pending_speeches.pop(ai_player_id, None)
+            logger.info("[发言] room=%s ai=%s discard=review reason=%s", room_code, _short_id(ai_player_id), _short_text(decision.reason))
+            return True
+
+        if action == "revise":
+            revised_parts = _pending_decision_message_parts(decision, self._settings.speech_max_segments)
+            if not revised_parts:
+                memory.pending_speeches.pop(ai_player_id, None)
+                logger.info("[发言] room=%s ai=%s discard=empty_revision", room_code, _short_id(ai_player_id))
+                return True
+            task.messages = list(task.sent_messages) + revised_parts
+            task.next_message_index = len(task.sent_messages)
+            delay = self._revised_speech_delay(revised_parts[0], original_remaining_delay)
+            task.due_at = now + delay
+            task.context_changed = False
+            task.review_requested = False
+            logger.info("[发言] room=%s ai=%s revise delay=%.1fs parts=%s reason=%s", room_code, _short_id(ai_player_id), delay, len(revised_parts), _short_text(decision.reason))
+            return task.due_at > now
+
+        if action == "continue":
+            if not task.remaining_messages():
+                memory.pending_speeches.pop(ai_player_id, None)
+                logger.info("[发言] room=%s ai=%s discard=no_remaining", room_code, _short_id(ai_player_id))
+                return True
+            delay = max(original_remaining_delay, self._settings.speech_context_reaction_delay_seconds)
+            task.due_at = now + min(delay, self._settings.speech_max_delay_seconds)
+            task.context_changed = False
+            task.review_requested = False
+            logger.info("[发言] room=%s ai=%s continue delay=%.1fs reason=%s", room_code, _short_id(ai_player_id), delay, _short_text(decision.reason))
+            return task.due_at > now
+
+        memory.pending_speeches.pop(ai_player_id, None)
+        logger.info("[发言] room=%s ai=%s discard=unknown_review_action action=%s", room_code, _short_id(ai_player_id), action)
+        return True
+
+    def _revised_speech_delay(self, message: str, original_remaining_delay: float) -> float:
+        recomputed_delay = self._speech_delay_seconds(message)
+        capped_delay = min(recomputed_delay, original_remaining_delay + self._settings.speech_revision_extra_delay_seconds)
+        return max(capped_delay, self._settings.speech_context_reaction_delay_seconds)
 
     async def _handle_voting_started(self, room_code: str, payload: dict[str, Any]) -> None:
         memory = self.room_memory(room_code)
@@ -459,9 +561,9 @@ class AgentRuntime:
                 current_topic=memory.current_topic,
             )
             decision = await self._decision_engine.decide_speech(context)
-            message = (decision.message or "").strip()
-            if decision.should_speak and message:
-                await self._schedule_speech(room_code, memory, ai_player_id, message[:300], messages)
+            speech_parts = _decision_message_parts(decision, self._settings.speech_max_segments)
+            if decision.should_speak and speech_parts:
+                await self._schedule_speech(room_code, memory, ai_player_id, speech_parts, messages)
             else:
                 logger.debug("[空闲] room=%s ai=%s decision=silent", room_code, _short_id(ai_player_id))
         await self.run_pending_speech_checks()
@@ -481,6 +583,37 @@ def _messages_after(message_id: str | None, messages: list[dict[str, Any]]) -> l
         if str(message.get("messageId")) == message_id:
             return messages[index + 1 :]
     return messages
+
+
+def _human_messages_after(message_id: str | None, messages: list[dict[str, Any]], ai_player_ids: set[str]) -> list[dict[str, Any]]:
+    return [
+        message
+        for message in _messages_after(message_id, messages)
+        if str(message.get("senderPlayerId") or "") not in ai_player_ids
+    ]
+
+
+def _decision_message_parts(decision: SpeechDecision, max_segments: int) -> list[str]:
+    return _normalize_speech_parts(decision.messages, decision.message, max_segments)
+
+
+def _pending_decision_message_parts(decision: PendingSpeechDecision, max_segments: int) -> list[str]:
+    return _normalize_speech_parts(decision.messages, decision.message, max_segments)
+
+
+def _normalize_speech_parts(parts: tuple[str, ...] | list[str], fallback: str | None, max_segments: int) -> list[str]:
+    raw_parts = list(parts) if parts else [fallback]
+    normalized: list[str] = []
+    for raw_part in raw_parts:
+        if not isinstance(raw_part, str):
+            continue
+        part = " ".join(raw_part.split()).strip()
+        if not part:
+            continue
+        normalized.append(part[:300])
+        if len(normalized) >= max_segments:
+            break
+    return normalized
 
 
 def _short_text(text: str, limit: int = 80) -> str:
