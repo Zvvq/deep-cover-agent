@@ -1,5 +1,4 @@
 from contextlib import asynccontextmanager
-import json
 import logging
 from typing import Annotated
 
@@ -19,10 +18,11 @@ logger = logging.getLogger("uvicorn.error")
 
 def build_runtime(settings: Settings) -> AgentRuntime:
     logger.info(
-        "Agent Runtime 配置：Java地址=%s，LangChain=%s，DeepSeek密钥=%s，空闲检查=%s秒，空闲发言阈值=%s秒",
+        "[配置] java=%s langchain=%s deepseek_key=%s thinking=%s idle_check=%.1fs idle_speech=%.1fs",
         settings.java_base_url,
-        "启用" if settings.enable_langchain else "关闭",
-        "已配置" if settings.deepseek_api_key is not None else "未配置",
+        "on" if settings.enable_langchain else "off",
+        "set" if settings.deepseek_api_key is not None else "unset",
+        "on" if settings.deepseek_thinking_enabled else "off",
         settings.idle_check_interval_seconds,
         settings.idle_speech_after_seconds,
     )
@@ -47,14 +47,14 @@ def create_app(settings: Settings | None = None, runtime: AgentRuntime | None = 
         start = getattr(resolved_runtime, "start", None)
         if start is not None:
             await start()
-        logger.info("Agent Runtime 已启动，等待 Java 推送游戏事件。")
+        logger.info("[系统] runtime=started")
         try:
             yield
         finally:
             shutdown_runtime = getattr(resolved_runtime, "shutdown", None)
             if shutdown_runtime is not None:
                 await shutdown_runtime()
-            logger.info("Agent Runtime 已停止。")
+            logger.info("[系统] runtime=stopped")
 
     app = FastAPI(title="Deep Cover Agent Runtime", lifespan=lifespan)
     app.state.settings = resolved_settings
@@ -65,16 +65,14 @@ def create_app(settings: Settings | None = None, runtime: AgentRuntime | None = 
         body = await request.body()
         client = f"{request.client.host}:{request.client.port}" if request.client else "-"
         logger.error(
-            "Agent 事件校验失败：客户端=%s，方法=%s，路径=%s，内容类型=%s，内容长度=%s，"
-            "User-Agent=%s，错误=%s，请求体=%s",
+            "[事件][校验失败] client=%s method=%s path=%s content_type=%s len=%s errors=%s body=%s",
             client,
             request.method,
             request.url.path,
             request.headers.get("content-type"),
             request.headers.get("content-length"),
-            request.headers.get("user-agent"),
             exc.errors(),
-            body.decode("utf-8", errors="replace")[:4000],
+            body.decode("utf-8", errors="replace")[:300],
         )
         return JSONResponse(
             status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
@@ -85,7 +83,7 @@ def create_app(settings: Settings | None = None, runtime: AgentRuntime | None = 
         x_internal_agent_secret: Annotated[str | None, Header(alias="X-Internal-Agent-Secret")] = None,
         ) -> None:
         if x_internal_agent_secret != app.state.settings.internal_agent_secret:
-            logger.warning("拒绝内部请求：X-Internal-Agent-Secret 不正确或缺失。")
+            logger.warning("[安全] reject=bad_internal_secret")
             raise HTTPException(
                 status_code=status.HTTP_401_UNAUTHORIZED,
                 detail="Invalid internal agent secret.",
@@ -103,26 +101,24 @@ def create_app(settings: Settings | None = None, runtime: AgentRuntime | None = 
     ) -> dict[str, bool]:
         if event.room_code != room_code:
             logger.warning(
-                "拒绝 Agent 事件：路径房间=%s 与事件房间=%s 不一致，事件ID=%s，类型=%s。",
+                "[事件][拒绝] reason=room_mismatch path_room=%s body_room=%s type=%s id=%s",
                 room_code,
                 event.room_code,
-                event.event_id,
                 event.type,
+                _short_id(event.event_id),
             )
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
                 detail="Path room code does not match event room code.",
             )
         logger.info(
-            "收到 Java 事件：房间=%s，类型=%s，事件ID=%s，创建时间=%s，payload=%s",
+            "[事件] room=%s type=%s id=%s %s",
             room_code,
             event.type,
-            event.event_id,
-            event.created_at.isoformat(),
-            _compact_json(event.payload),
+            _short_id(event.event_id),
+            _event_summary(event),
         )
         await app.state.runtime.handle_event(room_code, event)
-        logger.info("事件处理完成：房间=%s，类型=%s，事件ID=%s。", room_code, event.type, event.event_id)
         return {"accepted": True}
 
     return app
@@ -131,8 +127,37 @@ def create_app(settings: Settings | None = None, runtime: AgentRuntime | None = 
 app = create_app()
 
 
-def _compact_json(value: object, limit: int = 800) -> str:
-    text = json.dumps(value, ensure_ascii=False, default=str, separators=(",", ":"))
-    if len(text) <= limit:
-        return text
-    return text[: limit - 3] + "..."
+def _event_summary(event: AgentEvent) -> str:
+    payload = event.payload
+    if event.type == "CHAT_MESSAGE":
+        return "sender=%s text=%s" % (
+            _short_id(str(payload.get("senderPlayerId") or "")),
+            _short_text(str(payload.get("content") or "")),
+        )
+    if event.type == "ROOM_STARTED":
+        return "ai=%s topic=%s" % (
+            len(payload.get("aiPlayerIds") or []),
+            _short_text(str((payload.get("topic") or {}).get("content") or "无")),
+        )
+    if event.type == "ROUND_STARTED":
+        return "round=%s topic=%s" % (
+            payload.get("roundNumber"),
+            _short_text(str((payload.get("topic") or {}).get("content") or "无")),
+        )
+    if event.type == "VOTING_STARTED":
+        return "round=%s candidates=%s" % (
+            payload.get("roundNumber"),
+            len(payload.get("candidatePlayerIds") or []),
+        )
+    return ""
+
+
+def _short_id(value: str, length: int = 8) -> str:
+    return value[:length] if value else "-"
+
+
+def _short_text(text: str, limit: int = 40) -> str:
+    compact = " ".join(text.split())
+    if len(compact) <= limit:
+        return compact
+    return compact[: limit - 3] + "..."
