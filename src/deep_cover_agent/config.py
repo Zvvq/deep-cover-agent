@@ -16,6 +16,7 @@ class Settings(BaseSettings):
     request_timeout_seconds: float = 10.0
 
     deepseek_api_key: SecretStr | None = Field(default=None)
+    deepseek_base_url: str | None = None
     deepseek_model: str = "deepseek-v4-flash"
     deepseek_temperature: float = 0.7
     deepseek_max_retries: int = 2
