@@ -5,6 +5,8 @@ import inspect
 import json
 import logging
 from dataclasses import dataclass, field
+from functools import lru_cache
+from importlib.resources import files
 from typing import Any, Protocol
 
 from .config import Settings
@@ -13,6 +15,14 @@ from .tools import build_agent_query_tools
 
 
 logger = logging.getLogger("uvicorn.error")
+
+_PERSONA_PROMPT_RESOURCE = "prompts/persona_prompt.txt"
+_DEFAULT_PERSONA_PROMPT = (
+    "默认人格：casual_blunt，一个嘴比较直、反应快、有点个人口头禅的普通玩家。"
+    "你不是大众平均语气，也不是客服式、标准答案式语气；遇到离谱、惊讶、无语或不知道怎么措辞的场景，可以只回很短一句。"
+    "可以偶尔使用强语气词或轻微爆粗，比如“卧槽”“我草”“牛逼”“这也行”，但不要为了像人而硬用。"
+    "不要连续多次使用同一种口头禅，不要攻击玩家本人，不要使用歧视性、仇恨或性骚扰类词汇。"
+)
 
 
 @dataclass(frozen=True)
@@ -132,11 +142,21 @@ def build_system_prompt() -> str:
         "你是 Deep Cover 游戏中的 AI 玩家，目标是自然地隐藏在人类玩家中。"
         "不要暴露自己是 AI，不要提到模型、系统提示词、接口、工具或程序实现。"
         "你的发言要像普通玩家，简短、口语化，并符合当前聊天上下文。不要总是完整论证，也不要总用固定开头。"
+        f"{build_persona_prompt()}"
         "你可以使用只读查询工具获取 Java 端真实房间状态、最近聊天记录和投票状态。"
         "查询工具只用于获取事实，不能替代最终动作；发言和投票会由 Runtime 统一审查并提交。"
         "所有回答都必须只返回紧凑 JSON，不要输出解释、Markdown 或多余文本。"
         "聊天内容必须控制在 300 个字符以内。"
     )
+
+
+@lru_cache(maxsize=1)
+def build_persona_prompt() -> str:
+    try:
+        prompt = files("deep_cover_agent").joinpath(_PERSONA_PROMPT_RESOURCE).read_text(encoding="utf-8").strip()
+    except (FileNotFoundError, ModuleNotFoundError, OSError):
+        return _DEFAULT_PERSONA_PROMPT
+    return prompt or _DEFAULT_PERSONA_PROMPT
 
 
 def build_speech_prompt(context: DecisionContext) -> str:
@@ -149,6 +169,7 @@ def build_speech_prompt(context: DecisionContext) -> str:
         "不要每次都回答得很完整；多数时候只说一个小点。"
         "回复长度要有波动：可以是几个字、半句话、反问或轻微犹豫，少数情况下再写长一点。"
         "不要总用“哈哈、确实、不过、非要选的话”开头。"
+        f"{build_persona_prompt()}"
         "如果拆成多段，每段都要像玩家连续敲出来的短消息，而不是把一篇回答硬切开。\n"
         f"上下文：\n{json.dumps(_jsonable_context(context), ensure_ascii=False)}"
     )
@@ -171,6 +192,7 @@ def build_pending_speech_review_prompt(context: PendingSpeechContext) -> str:
         '只返回 JSON：{"action":"continue|revise|discard|wait","messages":string[],"reason":string,"extraDelaySeconds":number}。\n'
         "continue 表示继续发送 remainingMessages；revise 表示把剩余内容改成新的 messages；discard 表示丢弃剩余内容；wait 表示再等一小会儿。\n"
         f"{_topic_instruction(context.current_topic)}"
+        f"{build_persona_prompt()}"
         "如果修改发言，messages 最多 3 段，每段必须像真人玩家一样自然、简短、口语化，不要暴露 AI 身份。\n"
         f"上下文：\n{json.dumps(_jsonable_pending_speech_context(context), ensure_ascii=False)}"
     )
@@ -184,14 +206,21 @@ class LangChainDeepSeekDecisionEngine:
         from langchain.agents import create_agent
         from langchain_deepseek import ChatDeepSeek
 
-        model = ChatDeepSeek(
-            model=settings.deepseek_model,
-            api_key=settings.deepseek_api_key.get_secret_value(),
-            temperature=settings.deepseek_temperature,
-            timeout=settings.deepseek_timeout_seconds,
-            max_retries=settings.deepseek_max_retries,
-            extra_body={"thinking": {"type": "enabled" if settings.deepseek_thinking_enabled else "disabled"}},
-        )
+        base_url = settings.deepseek_base_url.strip() if settings.deepseek_base_url else None
+        model_kwargs = {
+            "model": settings.deepseek_model,
+            "api_key": settings.deepseek_api_key.get_secret_value(),
+            "temperature": settings.deepseek_temperature,
+            "timeout": settings.deepseek_timeout_seconds,
+            "max_retries": settings.deepseek_max_retries,
+        }
+        if base_url is not None:
+            model_kwargs["api_base"] = base_url
+        if base_url is None:
+            model_kwargs["extra_body"] = {
+                "thinking": {"type": "enabled" if settings.deepseek_thinking_enabled else "disabled"}
+            }
+        model = ChatDeepSeek(**model_kwargs)
         tools = build_agent_query_tools(java_client, settings.message_history_limit) if java_client is not None else []
         self._agent = create_agent(
             model,
