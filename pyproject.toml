@@ -30,6 +30,9 @@ deep-cover-agent = "deep_cover_agent.main:run"
 [tool.setuptools.packages.find]
 where = ["src"]
 
+[tool.setuptools.package-data]
+deep_cover_agent = ["prompts/*.txt"]
+
 [tool.pytest.ini_options]
 pythonpath = ["src"]
 asyncio_mode = "auto"
