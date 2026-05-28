@@ -1,5 +1,6 @@
-import sys
 import logging
+import sys
+from importlib.resources import files
 from types import SimpleNamespace
 
 import pytest
@@ -13,6 +14,7 @@ from deep_cover_agent.decision import (
     SpeechDecision,
     VoteDecision,
     build_pending_speech_review_prompt,
+    build_persona_prompt,
     build_speech_prompt,
     build_system_prompt,
     build_vote_prompt,
@@ -61,6 +63,51 @@ def test_langchain_prompts_are_written_in_chinese() -> None:
     assert "不能选择自己" in vote_prompt
 
 
+def test_speech_prompts_use_distinct_casual_blunt_persona() -> None:
+    context = DecisionContext(
+        room_code="ABC123",
+        ai_player_id="ai-1",
+        room_state={"status": "CHATTING"},
+        messages=[{"senderPlayerId": "human-1", "content": "我今天碰到个特别离谱的事"}],
+        current_topic=Topic(id="topic-001", content="聊聊最近遇到的离谱事"),
+    )
+    pending_context = PendingSpeechContext(
+        room_code="ABC123",
+        ai_player_id="ai-1",
+        room_state={"status": "CHATTING"},
+        messages=context.messages,
+        original_message="卧槽这也太离谱了",
+        remaining_messages=["这也能发生啊"],
+        current_topic=context.current_topic,
+    )
+
+    combined_prompt = "\n".join(
+        [
+            build_system_prompt(),
+            build_speech_prompt(context),
+            build_pending_speech_review_prompt(pending_context),
+        ]
+    )
+
+    assert "casual_blunt" in combined_prompt
+    assert "嘴比较直" in combined_prompt
+    assert "不是客服式、标准答案式语气" in combined_prompt
+    assert "不知道怎么措辞" in combined_prompt
+    assert "卧槽" in combined_prompt
+    assert "牛逼" in combined_prompt
+    assert "我草" in combined_prompt
+    assert "不要连续多次使用同一种口头禅" in combined_prompt
+    assert "不要攻击玩家本人" in combined_prompt
+    assert "不要使用歧视性、仇恨或性骚扰类词汇" in combined_prompt
+
+
+def test_persona_prompt_is_loaded_from_config_file() -> None:
+    prompt_path = files("deep_cover_agent").joinpath("prompts/persona_prompt.txt")
+
+    assert prompt_path.is_file()
+    assert build_persona_prompt() == prompt_path.read_text(encoding="utf-8").strip()
+
+
 def test_pending_speech_review_prompt_prioritizes_latest_messages() -> None:
     context = PendingSpeechContext(
         room_code="ABC123",
@@ -97,9 +144,30 @@ def test_langchain_deepseek_disables_thinking_mode_by_default(monkeypatch) -> No
     monkeypatch.setitem(sys.modules, "langchain.agents", SimpleNamespace(create_agent=fake_create_agent))
     monkeypatch.setitem(sys.modules, "langchain_deepseek", SimpleNamespace(ChatDeepSeek=FakeChatDeepSeek))
 
-    LangChainDeepSeekDecisionEngine(Settings(deepseek_api_key="test-key"))
+    LangChainDeepSeekDecisionEngine(Settings(_env_file=None, deepseek_api_key="test-key"))
 
     assert captured["model_kwargs"]["extra_body"] == {"thinking": {"type": "disabled"}}
+
+
+def test_langchain_deepseek_passes_custom_base_url(monkeypatch) -> None:
+    captured = {}
+
+    def fake_create_agent(model, tools, system_prompt):
+        captured["agent_model"] = model
+        return object()
+
+    monkeypatch.setitem(sys.modules, "langchain.agents", SimpleNamespace(create_agent=fake_create_agent))
+
+    LangChainDeepSeekDecisionEngine(
+        Settings(
+            _env_file=None,
+            deepseek_api_key="test-key",
+            deepseek_base_url="https://relay.example/v1",
+        )
+    )
+
+    assert str(captured["agent_model"].root_client.base_url) == "https://relay.example/v1/"
+    assert captured["agent_model"].model_kwargs == {}
 
 
 @pytest.mark.asyncio
