@@ -15,6 +15,7 @@ dependencies = [
     "langchain-deepseek>=1.0.0",
     "pydantic>=2.7.0",
     "pydantic-settings>=2.3.0",
+    "pyyaml>=6.0.0",
     "uvicorn[standard]>=0.30.0",
 ]
 
@@ -31,7 +32,7 @@ deep-cover-agent = "deep_cover_agent.main:run"
 where = ["src"]
 
 [tool.setuptools.package-data]
-deep_cover_agent = ["prompts/*.txt"]
+deep_cover_agent = ["prompts/*.yml"]
 
 [tool.pytest.ini_options]
 pythonpath = ["src"]
