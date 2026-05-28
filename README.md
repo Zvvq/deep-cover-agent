@@ -16,6 +16,16 @@ conda create -y -p .conda python=3.11 pip
 
 默认会通过 `DEEP_COVER_AGENT_DEEPSEEK_THINKING_ENABLED=false` 禁用 DeepSeek thinking mode，避免 LangChain 工具调用循环与 DeepSeek 的 `reasoning_content` 续传要求冲突。
 
+## 人格提示词
+
+Agent 可选人格提示词配置在：
+
+```text
+src/deep_cover_agent/prompts/persona_prompt.yml
+```
+
+当前 YAML 使用 `personas` 列表管理多个人格，每个人格用 `name` 标识名称，`prompt` 保存实际注入到模型上下文里的提示词。房间上下文创建时会随机选择一个人格并和房间号绑定，同一房间后续发言和草稿复核都会固定使用这个人格。修改后需要重启 Python Agent 才会生效。
+
 ## 启动
 
 ```powershell
