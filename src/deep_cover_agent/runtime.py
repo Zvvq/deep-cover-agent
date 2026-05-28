@@ -5,7 +5,7 @@ import contextlib
 import logging
 from dataclasses import dataclass, field
 from time import monotonic
-from typing import Any
+from typing import Any, Callable
 
 import httpx
 from pydantic import ValidationError
@@ -16,8 +16,10 @@ from .decision import (
     DecisionEngine,
     PendingSpeechContext,
     PendingSpeechDecision,
+    PersonaPrompt,
     RuleBasedDecisionEngine,
     SpeechDecision,
+    select_persona_prompt,
 )
 from .java_client import JavaAgentClient
 from .models import AgentEvent, AgentEventType, Topic
@@ -53,6 +55,7 @@ class PendingSpeechTask:
 
 @dataclass
 class RoomMemory:
+    persona: PersonaPrompt = field(default_factory=select_persona_prompt)
     ai_player_ids: set[str] = field(default_factory=set)
     processed_event_ids: set[str] = field(default_factory=set)
     attempted_votes: set[tuple[int, str]] = field(default_factory=set)
@@ -68,16 +71,23 @@ class AgentRuntime:
         java_client: JavaAgentClient,
         decision_engine: DecisionEngine | None = None,
         settings: Settings | None = None,
+        persona_selector: Callable[[], PersonaPrompt] | None = None,
     ) -> None:
         self._java_client = java_client
         self._decision_engine = decision_engine or RuleBasedDecisionEngine()
         self._settings = settings or Settings()
+        self._persona_selector = persona_selector or select_persona_prompt
         self._rooms: dict[str, RoomMemory] = {}
         self._idle_task: asyncio.Task[None] | None = None
         self._lock = asyncio.Lock()
 
     def room_memory(self, room_code: str) -> RoomMemory:
-        return self._rooms.setdefault(room_code, RoomMemory())
+        memory = self._rooms.get(room_code)
+        if memory is None:
+            memory = RoomMemory(persona=self._persona_selector())
+            self._rooms[room_code] = memory
+            logger.info("[房间] room=%s persona=%s selected=true", room_code, memory.persona.name)
+        return memory
 
     def _now(self) -> float:
         return monotonic()
@@ -137,10 +147,11 @@ class AgentRuntime:
         memory.ai_player_ids.update(str(player_id) for player_id in ai_player_ids)
         memory.current_topic = _topic_from_payload(payload.get("topic"))
         logger.info(
-            "[房间] room=%s started ai=%s topic=%s",
+            "[房间] room=%s started ai=%s topic=%s persona=%s",
             room_code,
             len(memory.ai_player_ids),
             _topic_text(memory.current_topic),
+            memory.persona.name,
         )
 
     async def _handle_chat_message(self, room_code: str, payload: dict[str, Any]) -> None:
@@ -196,6 +207,8 @@ class AgentRuntime:
                 room_state=room_state,
                 messages=messages,
                 current_topic=memory.current_topic,
+                persona_name=memory.persona.name,
+                persona_prompt=memory.persona.prompt,
             )
             decision = await self._decision_engine.decide_speech(context)
             speech_parts = _decision_message_parts(decision, self._settings.speech_max_segments)
@@ -299,6 +312,8 @@ class AgentRuntime:
                 remaining_messages=task.remaining_messages(),
                 new_messages=new_messages,
                 current_topic=memory.current_topic,
+                persona_name=memory.persona.name,
+                persona_prompt=memory.persona.prompt,
             )
             decision = await review(context)
             task.created_after_message_id = _last_message_id(messages)
@@ -475,6 +490,8 @@ class AgentRuntime:
                 room_state=room_state,
                 messages=messages_response.get("messages", []),
                 current_topic=memory.current_topic,
+                persona_name=memory.persona.name,
+                persona_prompt=memory.persona.prompt,
                 candidate_player_ids=candidates,
             )
             decision = await self._decision_engine.decide_vote(context)
@@ -559,6 +576,8 @@ class AgentRuntime:
                 room_state=room_state,
                 messages=messages,
                 current_topic=memory.current_topic,
+                persona_name=memory.persona.name,
+                persona_prompt=memory.persona.prompt,
             )
             decision = await self._decision_engine.decide_speech(context)
             speech_parts = _decision_message_parts(decision, self._settings.speech_max_segments)
