@@ -4,6 +4,7 @@ from importlib.resources import files
 from types import SimpleNamespace
 
 import pytest
+import yaml
 
 from deep_cover_agent.config import Settings
 from deep_cover_agent.decision import (
@@ -101,11 +102,33 @@ def test_speech_prompts_use_distinct_casual_blunt_persona() -> None:
     assert "不要使用歧视性、仇恨或性骚扰类词汇" in combined_prompt
 
 
-def test_persona_prompt_is_loaded_from_config_file() -> None:
-    prompt_path = files("deep_cover_agent").joinpath("prompts/persona_prompt.txt")
+def test_speech_prompt_uses_room_bound_persona() -> None:
+    context = DecisionContext(
+        room_code="ABC123",
+        ai_player_id="ai-1",
+        room_state={"status": "CHATTING"},
+        messages=[],
+        persona_name="lowkey_blunt",
+        persona_prompt="房间固定人格：低调直接，少解释，多用短句。",
+    )
+
+    prompt = build_speech_prompt(context)
+
+    assert "当前房间固定人格：lowkey_blunt" in prompt
+    assert "房间固定人格：低调直接，少解释，多用短句。" in prompt
+
+
+def test_persona_prompt_is_loaded_from_yaml_config_file() -> None:
+    prompt_path = files("deep_cover_agent").joinpath("prompts/persona_prompt.yml")
 
     assert prompt_path.is_file()
-    assert build_persona_prompt() == prompt_path.read_text(encoding="utf-8").strip()
+    config = yaml.safe_load(prompt_path.read_text(encoding="utf-8"))
+    personas = config.get("personas", [])
+
+    assert len(personas) == 3
+    assert [persona["name"] for persona in personas] == ["casual_blunt", "lowkey_blunt", "quick_reactor"]
+    assert build_persona_prompt() == personas[0]["prompt"].strip()
+    assert all("不要攻击玩家本人" in persona["prompt"] for persona in personas)
 
 
 def test_pending_speech_review_prompt_prioritizes_latest_messages() -> None:

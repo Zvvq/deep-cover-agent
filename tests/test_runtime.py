@@ -1,4 +1,5 @@
 import asyncio
+from types import SimpleNamespace
 
 import pytest
 
@@ -123,6 +124,56 @@ async def test_room_started_tracks_ai_players() -> None:
     )
 
     assert runtime.room_memory("ABC123").ai_player_ids == {"ai-1"}
+
+
+@pytest.mark.asyncio
+async def test_room_persona_is_selected_once_and_passed_to_decisions() -> None:
+    java_client = FakeJavaClient()
+    decision_engine = ScriptedDecisionEngine()
+    selected_personas = [
+        SimpleNamespace(name="lowkey_blunt", prompt="房间人格：低调直接。"),
+        SimpleNamespace(name="quick_reactor", prompt="房间人格：反应快一点。"),
+    ]
+
+    runtime = AgentRuntime(
+        java_client,
+        decision_engine,
+        immediate_settings(),
+        persona_selector=lambda: selected_personas.pop(0),
+    )
+
+    await runtime.handle_event(
+        "ABC123",
+        event("event-1", AgentEventType.ROOM_STARTED, {"roomCode": "ABC123", "aiPlayerIds": ["ai-1"]}),
+    )
+    await runtime.handle_event(
+        "ABC123",
+        event(
+            "event-2",
+            AgentEventType.CHAT_MESSAGE,
+            {
+                "messageId": "message-1",
+                "senderPlayerId": "human-1",
+                "content": "I went hiking last weekend.",
+                "createdAt": "2026-05-18T01:00:00Z",
+            },
+        ),
+    )
+    await runtime.handle_event(
+        "ABC123",
+        event(
+            "event-3",
+            AgentEventType.ROUND_STARTED,
+            {"roundNumber": 2, "topic": {"id": "topic-002", "content": "聊聊旅行"}},
+        ),
+    )
+
+    memory = runtime.room_memory("ABC123")
+    assert memory.persona.name == "lowkey_blunt"
+    assert memory.persona.prompt == "房间人格：低调直接。"
+    assert decision_engine.speech_calls[0].persona_name == "lowkey_blunt"
+    assert decision_engine.speech_calls[0].persona_prompt == "房间人格：低调直接。"
+    assert len(selected_personas) == 1
 
 
 @pytest.mark.asyncio
