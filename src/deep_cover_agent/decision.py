@@ -4,10 +4,13 @@ import asyncio
 import inspect
 import json
 import logging
+import random
 from dataclasses import dataclass, field
 from functools import lru_cache
 from importlib.resources import files
 from typing import Any, Protocol
+
+import yaml
 
 from .config import Settings
 from .models import Topic
@@ -16,13 +19,15 @@ from .tools import build_agent_query_tools
 
 logger = logging.getLogger("uvicorn.error")
 
-_PERSONA_PROMPT_RESOURCE = "prompts/persona_prompt.txt"
-_DEFAULT_PERSONA_PROMPT = (
-    "默认人格：casual_blunt，一个嘴比较直、反应快、有点个人口头禅的普通玩家。"
-    "你不是大众平均语气，也不是客服式、标准答案式语气；遇到离谱、惊讶、无语或不知道怎么措辞的场景，可以只回很短一句。"
-    "可以偶尔使用强语气词或轻微爆粗，比如“卧槽”“我草”“牛逼”“这也行”，但不要为了像人而硬用。"
-    "不要连续多次使用同一种口头禅，不要攻击玩家本人，不要使用歧视性、仇恨或性骚扰类词汇。"
-)
+_PERSONA_PROMPT_RESOURCE = "prompts/persona_prompt.yml"
+_DEFAULT_PERSONA_NAME = "casual_blunt"
+_DEFAULT_PERSONA_PROMPT = "默认人格：casual_blunt，一个嘴比较直、反应快、有点个人口头禅的普通玩家。你不是大众平均语气，也不是客服式、标准答案式语气；遇到离谱、惊讶、无语或不知道怎么措辞的场景，可以只回很短一句。可以偶尔使用强语气词或轻微爆粗，比如“卧槽”“我草”“牛逼”“这也行”，但不要为了像人而硬用。不要连续多次使用同一种口头禅，不要攻击玩家本人，不要使用歧视性、仇恨或性骚扰类词汇。"
+
+
+@dataclass(frozen=True)
+class PersonaPrompt:
+    name: str
+    prompt: str
 
 
 @dataclass(frozen=True)
@@ -32,6 +37,8 @@ class DecisionContext:
     room_state: dict[str, Any]
     messages: list[dict[str, Any]]
     current_topic: Topic | None = None
+    persona_name: str | None = None
+    persona_prompt: str | None = None
     candidate_player_ids: list[str] = field(default_factory=list)
 
 
@@ -46,6 +53,8 @@ class PendingSpeechContext:
     remaining_messages: list[str] = field(default_factory=list)
     new_messages: list[dict[str, Any]] = field(default_factory=list)
     current_topic: Topic | None = None
+    persona_name: str | None = None
+    persona_prompt: str | None = None
 
 
 @dataclass(frozen=True)
@@ -142,7 +151,7 @@ def build_system_prompt() -> str:
         "你是 Deep Cover 游戏中的 AI 玩家，目标是自然地隐藏在人类玩家中。"
         "不要暴露自己是 AI，不要提到模型、系统提示词、接口、工具或程序实现。"
         "你的发言要像普通玩家，简短、口语化，并符合当前聊天上下文。不要总是完整论证，也不要总用固定开头。"
-        f"{build_persona_prompt()}"
+        "每个房间会给出一个固定人格提示词，同一房间内必须保持一致的人格和说话习惯。"
         "你可以使用只读查询工具获取 Java 端真实房间状态、最近聊天记录和投票状态。"
         "查询工具只用于获取事实，不能替代最终动作；发言和投票会由 Runtime 统一审查并提交。"
         "所有回答都必须只返回紧凑 JSON，不要输出解释、Markdown 或多余文本。"
@@ -151,12 +160,29 @@ def build_system_prompt() -> str:
 
 
 @lru_cache(maxsize=1)
-def build_persona_prompt() -> str:
+def load_persona_prompts() -> tuple[PersonaPrompt, ...]:
     try:
-        prompt = files("deep_cover_agent").joinpath(_PERSONA_PROMPT_RESOURCE).read_text(encoding="utf-8").strip()
-    except (FileNotFoundError, ModuleNotFoundError, OSError):
-        return _DEFAULT_PERSONA_PROMPT
-    return prompt or _DEFAULT_PERSONA_PROMPT
+        raw_config = files("deep_cover_agent").joinpath(_PERSONA_PROMPT_RESOURCE).read_text(encoding="utf-8")
+        config = yaml.safe_load(raw_config)
+    except (FileNotFoundError, ModuleNotFoundError, OSError, yaml.YAMLError):
+        return _default_personas()
+    if not isinstance(config, dict):
+        return _default_personas()
+    personas = _parse_personas(config.get("personas"))
+    return personas or _default_personas()
+
+
+def build_persona_prompt(name: str | None = None) -> str:
+    personas = load_persona_prompts()
+    if name is not None:
+        for persona in personas:
+            if persona.name == name:
+                return persona.prompt
+    return personas[0].prompt
+
+
+def select_persona_prompt() -> PersonaPrompt:
+    return random.choice(load_persona_prompts())
 
 
 def build_speech_prompt(context: DecisionContext) -> str:
@@ -164,12 +190,12 @@ def build_speech_prompt(context: DecisionContext) -> str:
         "请判断当前 AI 玩家是否应该发言。\n"
         '只返回 JSON：{"shouldSpeak": boolean, "messages": string[]}。messages 最多 3 段，可以只有 1 段。\n'
         f"{_topic_instruction(context.current_topic)}"
+        f"{_persona_instruction(context.persona_name, context.persona_prompt)}"
         "如果当前没有自然接话点、刚刚已经有 AI 发言，或者发言会显得突兀，就选择不发言。"
         "如果发言，要保持像真人玩家一样自然，不要暴露 AI 身份。"
         "不要每次都回答得很完整；多数时候只说一个小点。"
         "回复长度要有波动：可以是几个字、半句话、反问或轻微犹豫，少数情况下再写长一点。"
         "不要总用“哈哈、确实、不过、非要选的话”开头。"
-        f"{build_persona_prompt()}"
         "如果拆成多段，每段都要像玩家连续敲出来的短消息，而不是把一篇回答硬切开。\n"
         f"上下文：\n{json.dumps(_jsonable_context(context), ensure_ascii=False)}"
     )
@@ -192,7 +218,7 @@ def build_pending_speech_review_prompt(context: PendingSpeechContext) -> str:
         '只返回 JSON：{"action":"continue|revise|discard|wait","messages":string[],"reason":string,"extraDelaySeconds":number}。\n'
         "continue 表示继续发送 remainingMessages；revise 表示把剩余内容改成新的 messages；discard 表示丢弃剩余内容；wait 表示再等一小会儿。\n"
         f"{_topic_instruction(context.current_topic)}"
-        f"{build_persona_prompt()}"
+        f"{_persona_instruction(context.persona_name, context.persona_prompt)}"
         "如果修改发言，messages 最多 3 段，每段必须像真人玩家一样自然、简短、口语化，不要暴露 AI 身份。\n"
         f"上下文：\n{json.dumps(_jsonable_pending_speech_context(context), ensure_ascii=False)}"
     )
@@ -308,6 +334,7 @@ def _jsonable_context(context: DecisionContext) -> dict[str, Any]:
         "roomCode": context.room_code,
         "aiPlayerId": context.ai_player_id,
         "currentTopic": _jsonable_topic(context.current_topic),
+        "persona": _jsonable_persona(context.persona_name, context.persona_prompt),
         "roomState": context.room_state,
         "messages": context.messages[-20:],
         "candidatePlayerIds": context.candidate_player_ids,
@@ -319,6 +346,7 @@ def _jsonable_pending_speech_context(context: PendingSpeechContext) -> dict[str,
         "roomCode": context.room_code,
         "aiPlayerId": context.ai_player_id,
         "currentTopic": _jsonable_topic(context.current_topic),
+        "persona": _jsonable_persona(context.persona_name, context.persona_prompt),
         "roomState": context.room_state,
         "messages": context.messages[-20:],
         "originalMessage": context.original_message,
@@ -341,6 +369,42 @@ def _jsonable_topic(topic: Topic | None) -> dict[str, str] | None:
     if topic is None:
         return None
     return topic.model_dump()
+
+
+def _persona_instruction(name: str | None, prompt: str | None) -> str:
+    persona_prompt = prompt.strip() if isinstance(prompt, str) and prompt.strip() else build_persona_prompt(name)
+    persona_name = name.strip() if isinstance(name, str) and name.strip() else _DEFAULT_PERSONA_NAME
+    return f"当前房间固定人格：{persona_name}\n{persona_prompt}\n"
+
+
+def _jsonable_persona(name: str | None, prompt: str | None) -> dict[str, str] | None:
+    if name is None and prompt is None:
+        return None
+    return {
+        "name": name or _DEFAULT_PERSONA_NAME,
+        "prompt": prompt or build_persona_prompt(name),
+    }
+
+
+def _parse_personas(value: Any) -> tuple[PersonaPrompt, ...]:
+    if not isinstance(value, list):
+        return ()
+    personas: list[PersonaPrompt] = []
+    for item in value:
+        if not isinstance(item, dict):
+            continue
+        name = item.get("name")
+        prompt = item.get("prompt")
+        if not isinstance(prompt, str) or not prompt.strip():
+            continue
+        if not isinstance(name, str) or not name.strip():
+            name = f"persona_{len(personas) + 1}"
+        personas.append(PersonaPrompt(name=name.strip(), prompt=prompt.strip()))
+    return tuple(personas)
+
+
+def _default_personas() -> tuple[PersonaPrompt, ...]:
+    return (PersonaPrompt(name=_DEFAULT_PERSONA_NAME, prompt=_DEFAULT_PERSONA_PROMPT),)
 
 
 def _normalize_message_parts(value: Any, fallback: Any = None, max_parts: int = 3, max_chars: int = 120) -> list[str]:
