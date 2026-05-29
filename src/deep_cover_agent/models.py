@@ -69,6 +69,7 @@ class Topic(JavaModel):
 
 class AgentRoomStateResponse(JavaModel):
     room_code: str = Field(alias="roomCode")
+    game_mode: str | None = Field(default=None, alias="gameMode")
     status: str
     round_number: int = Field(alias="roundNumber")
     alive_human_count: int = Field(alias="aliveHumanCount")
