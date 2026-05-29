@@ -27,6 +27,11 @@ from .models import AgentEvent, AgentEventType, Topic
 
 logger = logging.getLogger("uvicorn.error")
 
+GAME_MODE_WORD_UNDERCOVER = "WORD_UNDERCOVER"
+STATUS_CHATTING = "CHATTING"
+STATUS_DESCRIBING = "DESCRIBING"
+STATUS_VOTING = "VOTING"
+
 
 @dataclass
 class PendingSpeechTask:
@@ -62,7 +67,28 @@ class RoomMemory:
     pending_vote_payload: dict[str, Any] | None = None
     pending_speeches: dict[str, PendingSpeechTask] = field(default_factory=dict)
     current_topic: Topic | None = None
+    game_mode: str | None = None
     last_activity_at: float = field(default_factory=monotonic)
+
+
+class WordModeHandler:
+    def should_noop(self, memory: RoomMemory, room_state: dict[str, Any] | None = None) -> bool:
+        return _is_word_undercover_mode(memory, room_state)
+
+    def log_noop(
+        self,
+        room_code: str,
+        trigger: str,
+        memory: RoomMemory,
+        room_state: dict[str, Any] | None = None,
+    ) -> None:
+        logger.info(
+            "[关键词卧底] room=%s trigger=%s mode=%s status=%s action=noop reason=agent_behavior_not_integrated",
+            room_code,
+            trigger,
+            _room_game_mode(memory, room_state),
+            _room_status(room_state),
+        )
 
 
 class AgentRuntime:
@@ -72,11 +98,13 @@ class AgentRuntime:
         decision_engine: DecisionEngine | None = None,
         settings: Settings | None = None,
         persona_selector: Callable[[], PersonaPrompt] | None = None,
+        word_mode_handler: WordModeHandler | None = None,
     ) -> None:
         self._java_client = java_client
         self._decision_engine = decision_engine or RuleBasedDecisionEngine()
         self._settings = settings or Settings()
         self._persona_selector = persona_selector or select_persona_prompt
+        self._word_mode_handler = word_mode_handler or WordModeHandler()
         self._rooms: dict[str, RoomMemory] = {}
         self._idle_task: asyncio.Task[None] | None = None
         self._lock = asyncio.Lock()
@@ -131,6 +159,7 @@ class AgentRuntime:
             memory.attempted_votes.clear()
             memory.pending_vote_payload = None
             memory.pending_speeches.clear()
+            self._sync_game_mode(memory, event.payload)
             memory.current_topic = _topic_from_payload(event.payload.get("topic"))
             logger.info(
                 "[房间] room=%s round=%s topic=%s reset=round_tasks",
@@ -145,14 +174,18 @@ class AgentRuntime:
     def _handle_room_started(self, room_code: str, memory: RoomMemory, payload: dict[str, Any]) -> None:
         ai_player_ids = payload.get("aiPlayerIds") or []
         memory.ai_player_ids.update(str(player_id) for player_id in ai_player_ids)
+        self._sync_game_mode(memory, payload)
         memory.current_topic = _topic_from_payload(payload.get("topic"))
         logger.info(
-            "[房间] room=%s started ai=%s topic=%s persona=%s",
+            "[房间] room=%s started ai=%s mode=%s topic=%s persona=%s",
             room_code,
             len(memory.ai_player_ids),
+            memory.game_mode or "UNKNOWN",
             _topic_text(memory.current_topic),
             memory.persona.name,
         )
+        if self._word_mode_handler.should_noop(memory):
+            self._word_mode_handler.log_noop(room_code, "room_started", memory)
 
     async def _handle_chat_message(self, room_code: str, payload: dict[str, Any]) -> None:
         memory = self.room_memory(room_code)
@@ -163,9 +196,14 @@ class AgentRuntime:
 
         try:
             room_state = await self._java_client.get_room_state(room_code)
+            self._sync_game_mode(memory, room_state)
             self._sync_ai_players(memory, room_state)
             self._sync_current_topic(memory, room_state)
-            if room_state.get("status") != "CHATTING":
+            if self._word_mode_handler.should_noop(memory, room_state):
+                memory.pending_speeches.clear()
+                self._word_mode_handler.log_noop(room_code, "chat_message", memory, room_state)
+                return
+            if room_state.get("status") != STATUS_CHATTING:
                 logger.debug("[聊天] skip=status room=%s status=%s", room_code, room_state.get("status"))
                 return
             messages_response = await self._java_client.get_messages(room_code, self._settings.message_history_limit)
@@ -278,9 +316,14 @@ class AgentRuntime:
             return
         try:
             room_state = await self._java_client.get_room_state(room_code)
+            self._sync_game_mode(memory, room_state)
             self._sync_ai_players(memory, room_state)
             self._sync_current_topic(memory, room_state)
-            if room_state.get("status") != "CHATTING":
+            if self._word_mode_handler.should_noop(memory, room_state):
+                memory.pending_speeches.pop(ai_player_id, None)
+                self._word_mode_handler.log_noop(room_code, "pending_speech", memory, room_state)
+                return
+            if room_state.get("status") != STATUS_CHATTING:
                 memory.pending_speeches.pop(ai_player_id, None)
                 logger.info("[发言] room=%s ai=%s discard=status_%s", room_code, _short_id(ai_player_id), room_state.get("status"))
                 return
@@ -427,6 +470,11 @@ class AgentRuntime:
     async def _handle_voting_started(self, room_code: str, payload: dict[str, Any]) -> None:
         memory = self.room_memory(room_code)
         memory.pending_speeches.clear()
+        self._sync_game_mode(memory, payload)
+        if self._word_mode_handler.should_noop(memory, payload):
+            memory.pending_vote_payload = None
+            self._word_mode_handler.log_noop(room_code, "voting_started", memory, payload)
+            return
         memory.pending_vote_payload = dict(payload)
         logger.info("[投票] room=%s started clear_drafts=true", room_code)
         await self._attempt_votes(room_code, memory, memory.pending_vote_payload, "投票开始事件")
@@ -440,9 +488,14 @@ class AgentRuntime:
     ) -> None:
         try:
             room_state = await self._java_client.get_room_state(room_code)
+            self._sync_game_mode(memory, room_state)
             self._sync_ai_players(memory, room_state)
             self._sync_current_topic(memory, room_state)
-            if room_state.get("status") != "VOTING":
+            if self._word_mode_handler.should_noop(memory, room_state):
+                memory.pending_vote_payload = None
+                self._word_mode_handler.log_noop(room_code, trigger, memory, room_state)
+                return
+            if room_state.get("status") != STATUS_VOTING:
                 logger.info("[投票] room=%s wait=status_%s trigger=%s", room_code, room_state.get("status"), trigger)
                 return
             messages_response = await self._java_client.get_messages(room_code, self._settings.message_history_limit)
@@ -521,6 +574,10 @@ class AgentRuntime:
             if player.get("type") == "AI":
                 memory.ai_player_ids.add(str(player.get("playerId")))
 
+    def _sync_game_mode(self, memory: RoomMemory, source: dict[str, Any]) -> None:
+        if "gameMode" in source and source.get("gameMode") is not None:
+            memory.game_mode = str(source.get("gameMode"))
+
     def _sync_current_topic(self, memory: RoomMemory, room_state: dict[str, Any]) -> None:
         if "topic" in room_state:
             memory.current_topic = _topic_from_payload(room_state.get("topic"))
@@ -556,9 +613,13 @@ class AgentRuntime:
         memory = self.room_memory(room_code)
         try:
             room_state = await self._java_client.get_room_state(room_code)
+            self._sync_game_mode(memory, room_state)
             self._sync_ai_players(memory, room_state)
             self._sync_current_topic(memory, room_state)
-            if room_state.get("status") != "CHATTING":
+            if self._word_mode_handler.should_noop(memory, room_state):
+                self._word_mode_handler.log_noop(room_code, "idle_speech", memory, room_state)
+                return
+            if room_state.get("status") != STATUS_CHATTING:
                 logger.debug("[空闲] room=%s skip=status_%s", room_code, room_state.get("status"))
                 return
             messages_response = await self._java_client.get_messages(room_code, self._settings.message_history_limit)
@@ -656,6 +717,22 @@ def _topic_text(topic: Topic | None) -> str:
     if topic is None:
         return "无"
     return topic.content
+
+
+def _is_word_undercover_mode(memory: RoomMemory, room_state: dict[str, Any] | None = None) -> bool:
+    return _room_game_mode(memory, room_state) == GAME_MODE_WORD_UNDERCOVER or _room_status(room_state) == STATUS_DESCRIBING
+
+
+def _room_game_mode(memory: RoomMemory, room_state: dict[str, Any] | None = None) -> str:
+    if room_state is not None and room_state.get("gameMode") is not None:
+        return str(room_state.get("gameMode"))
+    return memory.game_mode or "UNKNOWN"
+
+
+def _room_status(room_state: dict[str, Any] | None = None) -> str:
+    if room_state is not None and room_state.get("status") is not None:
+        return str(room_state.get("status"))
+    return "UNKNOWN"
 
 
 def _short_id(value: str, length: int = 8) -> str:
