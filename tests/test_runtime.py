@@ -367,6 +367,70 @@ async def test_voting_started_state_race_is_retried_by_periodic_check() -> None:
 
 
 @pytest.mark.asyncio
+async def test_word_undercover_describing_mode_does_not_trigger_speech() -> None:
+    java_client = FakeJavaClient()
+    java_client.room_state["gameMode"] = "WORD_UNDERCOVER"
+    java_client.room_state["status"] = "DESCRIBING"
+    decision_engine = ScriptedDecisionEngine()
+    runtime = AgentRuntime(java_client, decision_engine, immediate_settings())
+    await runtime.handle_event(
+        "ABC123",
+        event(
+            "event-1",
+            AgentEventType.ROOM_STARTED,
+            {"roomCode": "ABC123", "gameMode": "WORD_UNDERCOVER", "aiPlayerIds": ["ai-1"]},
+        ),
+    )
+
+    await runtime.handle_event(
+        "ABC123",
+        event(
+            "event-2",
+            AgentEventType.CHAT_MESSAGE,
+            {
+                "messageId": "message-1",
+                "senderPlayerId": "human-1",
+                "content": "I went hiking last weekend.",
+                "createdAt": "2026-05-18T01:00:00Z",
+            },
+        ),
+    )
+
+    assert decision_engine.speech_calls == []
+    assert java_client.sent_messages == []
+
+
+@pytest.mark.asyncio
+async def test_word_undercover_mode_does_not_call_vote_api() -> None:
+    java_client = FakeJavaClient()
+    java_client.room_state["gameMode"] = "WORD_UNDERCOVER"
+    java_client.room_state["status"] = "VOTING"
+    decision_engine = ScriptedDecisionEngine()
+    runtime = AgentRuntime(java_client, decision_engine, immediate_settings())
+    await runtime.handle_event(
+        "ABC123",
+        event(
+            "event-1",
+            AgentEventType.ROOM_STARTED,
+            {"roomCode": "ABC123", "gameMode": "WORD_UNDERCOVER", "aiPlayerIds": ["ai-1"]},
+        ),
+    )
+
+    await runtime.handle_event(
+        "ABC123",
+        event(
+            "event-2",
+            AgentEventType.VOTING_STARTED,
+            {"roomCode": "ABC123", "roundNumber": 1, "candidatePlayerIds": ["human-1", "human-2", "ai-1"]},
+        ),
+    )
+    await runtime.run_idle_checks()
+
+    assert decision_engine.vote_calls == []
+    assert java_client.cast_votes == []
+
+
+@pytest.mark.asyncio
 async def test_chat_response_waits_until_typing_delay_expires() -> None:
     java_client = FakeJavaClient()
     runtime = AgentRuntime(
