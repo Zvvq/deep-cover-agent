@@ -149,6 +149,19 @@ def _event_summary(event: AgentEvent) -> str:
             payload.get("roundNumber"),
             len(payload.get("candidatePlayerIds") or []),
         )
+    if event.type == "WORD_ROUND_STARTED":
+        return "round=%s current=%s number=%s" % (
+            payload.get("roundNumber"),
+            _short_id(str(payload.get("currentPlayerId") or "")),
+            payload.get("currentNumber"),
+        )
+    if event.type == "WORD_DESCRIPTION_SUBMITTED":
+        description = payload.get("description") or {}
+        return "round=%s player=%s number=%s" % (
+            payload.get("roundNumber"),
+            _short_id(str(description.get("playerId") or "")),
+            description.get("number"),
+        )
     return ""
 
 
