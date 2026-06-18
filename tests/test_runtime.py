@@ -6,7 +6,7 @@ import pytest
 from deep_cover_agent.config import Settings
 from deep_cover_agent.decision import PendingSpeechDecision, SpeechDecision, VoteDecision
 from deep_cover_agent.models import AgentEvent, AgentEventType, Topic
-from deep_cover_agent.runtime import AgentRuntime
+from deep_cover_agent.runtime import AgentRuntime, PendingSpeechTask
 
 
 class FakeJavaClient:
@@ -427,6 +427,61 @@ async def test_word_undercover_mode_does_not_call_vote_api() -> None:
     await runtime.run_idle_checks()
 
     assert decision_engine.vote_calls == []
+    assert java_client.cast_votes == []
+
+
+@pytest.mark.asyncio
+async def test_word_undercover_push_events_are_explicit_noop_and_clear_temporary_tasks() -> None:
+    java_client = FakeJavaClient()
+    decision_engine = ScriptedDecisionEngine()
+    runtime = AgentRuntime(java_client, decision_engine, immediate_settings())
+    await runtime.handle_event(
+        "ABC123",
+        event(
+            "event-1",
+            AgentEventType.ROOM_STARTED,
+            {"roomCode": "ABC123", "gameMode": "WORD_UNDERCOVER", "aiPlayerIds": ["ai-1"]},
+        ),
+    )
+    memory = runtime.room_memory("ABC123")
+    memory.pending_vote_payload = {"roundNumber": 1}
+    memory.pending_speeches["ai-1"] = PendingSpeechTask(
+        ai_player_id="ai-1",
+        messages=["old draft"],
+        created_after_message_id=None,
+        due_at=0,
+    )
+
+    await runtime.handle_event(
+        "ABC123",
+        event(
+            "event-2",
+            AgentEventType.WORD_ROUND_STARTED,
+            {
+                "roomCode": "ABC123",
+                "roundNumber": 1,
+                "currentPlayerId": "player-1",
+                "currentNumber": 1,
+            },
+        ),
+    )
+    await runtime.handle_event(
+        "ABC123",
+        event(
+            "event-3",
+            AgentEventType.WORD_DESCRIPTION_SUBMITTED,
+            {
+                "roundNumber": 1,
+                "description": {"playerId": "player-1", "number": 1, "content": "偏日常的东西"},
+            },
+        ),
+    )
+
+    assert memory.pending_vote_payload is None
+    assert memory.pending_speeches == {}
+    assert decision_engine.speech_calls == []
+    assert decision_engine.vote_calls == []
+    assert java_client.sent_messages == []
     assert java_client.cast_votes == []
 
 

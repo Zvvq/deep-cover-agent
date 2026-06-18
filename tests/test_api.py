@@ -27,6 +27,40 @@ def agent_event(room_code: str = "ABC123") -> dict:
     }
 
 
+def word_round_started_event(room_code: str = "ABC123") -> dict:
+    return {
+        "eventId": "word-event-1",
+        "type": "WORD_ROUND_STARTED",
+        "roomCode": room_code,
+        "createdAt": "2026-06-10T01:22:18.910027700Z",
+        "payload": {
+            "roomCode": room_code,
+            "roundNumber": 1,
+            "currentPlayerId": "player-1",
+            "currentNumber": 1,
+        },
+    }
+
+
+def word_description_submitted_event(room_code: str = "ABC123") -> dict:
+    return {
+        "eventId": "word-event-2",
+        "type": "WORD_DESCRIPTION_SUBMITTED",
+        "roomCode": room_code,
+        "createdAt": "2026-06-10T01:22:37.546496700Z",
+        "payload": {
+            "roundNumber": 1,
+            "description": {
+                "playerId": "player-1",
+                "number": 1,
+                "color": "RED",
+                "playerType": "HUMAN",
+                "content": "偏日常的东西",
+            },
+        },
+    }
+
+
 def test_build_runtime_passes_java_client_to_langchain_engine(monkeypatch) -> None:
     captured = {}
 
@@ -70,6 +104,26 @@ def test_accepts_event_with_internal_secret() -> None:
     assert len(runtime.events) == 1
     assert runtime.events[0][0] == "ABC123"
     assert runtime.events[0][1].event_id == "event-1"
+
+
+def test_accepts_word_undercover_events_with_internal_secret() -> None:
+    runtime = RecordingRuntime()
+    app = create_app(Settings(internal_agent_secret="test-secret"), runtime)
+    client = TestClient(app)
+
+    for payload in [word_round_started_event(), word_description_submitted_event()]:
+        response = client.post(
+            "/agent/rooms/ABC123/events",
+            json=payload,
+            headers={"X-Internal-Agent-Secret": "test-secret"},
+        )
+
+        assert response.status_code == 202
+
+    assert [event.type for _, event in runtime.events] == [
+        "WORD_ROUND_STARTED",
+        "WORD_DESCRIPTION_SUBMITTED",
+    ]
 
 
 def test_accepts_event_logs_chinese_business_messages(caplog) -> None:
