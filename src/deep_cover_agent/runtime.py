@@ -167,6 +167,15 @@ class AgentRuntime:
                 event.payload.get("roundNumber"),
                 _topic_text(memory.current_topic),
             )
+        elif event.type == AgentEventType.WORD_ROUND_STARTED:
+            memory.attempted_votes.clear()
+            memory.pending_vote_payload = None
+            memory.pending_speeches.clear()
+            self._sync_game_mode(memory, event.payload)
+            self._word_mode_handler.log_noop(room_code, "word_round_started", memory, event.payload)
+        elif event.type == AgentEventType.WORD_DESCRIPTION_SUBMITTED:
+            self._sync_game_mode(memory, event.payload)
+            self._word_mode_handler.log_noop(room_code, "word_description_submitted", memory, event.payload)
         elif event.type in {AgentEventType.GAME_ENDED, AgentEventType.ROOM_DESTROYED}:
             self._rooms.pop(room_code, None)
             logger.info("[房间] room=%s closed type=%s", room_code, event.type)
